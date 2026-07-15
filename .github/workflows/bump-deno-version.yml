@@ -1,0 +1,53 @@
+name: bump-deno-version
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write # Dagger Cloud auth via GitHub OIDC token
+  contents: write # create-pull-request pushes the bump branch
+  pull-requests: write # create-pull-request opens the PR
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The module targets a beta engine; read the pin so the action installs the
+      # matching CLI (which provisions the matching engine) rather than duplicating it.
+      - id: engine
+        run: echo "version=$(sed -n 's/engineVersion = "\(.*\)"/\1/p' dagger-module.toml)" >> "$GITHUB_OUTPUT"
+
+      # Apply the bump to the working tree (auto-apply the returned changeset).
+      - uses: dagger/dagger-for-github@v8.4.0
+        with:
+          version: ${{ steps.engine.outputs.version }}
+          verb: call
+          module: ./.dagger/modules/maintenance
+          call: bump-deno-version
+          dagger-flags: "-y"
+          cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+
+      # Verify: the e2e suite runs on the *default* version, so this gates both
+      # "the new tag's images are published" and "the samples still pass".
+      - uses: dagger/dagger-for-github@v8.4.0
+        with:
+          version: ${{ steps.engine.outputs.version }}
+          verb: check
+          cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+
+      # Only reached when verify passes. No diff -> no PR.
+      - uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/bump-deno-version
+          title: "chore: bump default Deno version"
+          commit-message: "chore: bump default Deno version"
+          labels: dependencies, automated
+          signoff: true
+          body: |
+            Automated bump of the module's default Deno version, verified with
+            `dagger check` (the e2e suite runs on the default version, so a green
+            run means the new tag's images are published and the samples pass).

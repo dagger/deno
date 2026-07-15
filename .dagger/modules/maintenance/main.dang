@@ -1,0 +1,88 @@
+"""
+Repository maintenance tasks for the Deno module.
+
+Keeps the module's pinned default Deno version current: resolve the latest stable
+release from denoland/deno's git tags, and rewrite the `version` default in
+deno.dang (plus the illustrative versions in README.md) as a reviewable changeset.
+"""
+type Maintenance {
+  """
+  Latest stable Deno release (e.g. "2.9.3"), read from denoland/deno's git tags.
+  Pre-releases (tags carrying a suffix such as -rc.1) are excluded.
+  """
+  pub latestDenoVersion(): String! {
+    git("https://github.com/denoland/deno").tags
+      .filter { tag => tag.containsMatch(`^v[0-9]+\.[0-9]+\.[0-9]+$`) }
+      .map { tag => tag.trimPrefix("v") }
+      .reduce("0.0.0") { max, v => if (semverGt(v, max)) { v } else { max } }
+  }
+
+  """
+  Bump the module's default Deno version and return the diff. Rewrites the
+  `version` default in deno.dang and the matching version strings in README.md.
+  Defaults to the latest stable release; pass `version` to pin an explicit target.
+  """
+  pub bumpDenoVersion(ws: Workspace!, version: String! = ""): Changeset! {
+    let target = if (version == "") { latestDenoVersion() } else { version }
+    let before = ws.directory(".", include: ["deno.dang", "README.md"])
+    let current = currentDefault(before)
+
+    let denoDang = before.file("deno.dang").contents.replaceMatches(
+      `pub version: String! = "[0-9]+\.[0-9]+\.[0-9]+"`,
+      with: "pub version: String! = \"" + target + "\"",
+    )
+    let readme = before.file("README.md").contents.replace(current, target)
+
+    let after = before
+      .withNewFile("deno.dang", denoDang)
+      .withNewFile("README.md", readme)
+    after.changes(before)
+  }
+
+  """
+  The current default Deno version declared in deno.dang.
+  """
+  let currentDefault(dir: Directory!): String! {
+    let m = dir.file("deno.dang").contents.match(
+      `pub version: String! = "([0-9]+\.[0-9]+\.[0-9]+)"`,
+    )
+    if (m == null) {
+      raise "could not find the `pub version` default in deno.dang"
+    } else {
+      let cap = m.captures[0]
+      if (cap == null) { raise "deno.dang version capture was empty" } else { cap }
+    }
+  }
+
+  """
+  Whether version `a` is strictly greater than `b` (both "X.Y.Z"), comparing
+  major, then minor, then patch numerically.
+  """
+  let semverGt(a: String!, b: String!): Boolean! {
+    let pa = a.split(".")
+    let pb = b.split(".")
+    let amaj = pa[0] ?? "0"
+    let bmaj = pb[0] ?? "0"
+    let amin = pa[1] ?? "0"
+    let bmin = pb[1] ?? "0"
+    let apat = pa[2] ?? "0"
+    let bpat = pb[2] ?? "0"
+    if (amaj != bmaj) {
+      numGt(amaj, bmaj)
+    } else if (amin != bmin) {
+      numGt(amin, bmin)
+    } else {
+      numGt(apat, bpat)
+    }
+  }
+
+  """
+  Strict numeric `>` for two non-negative integer strings without leading zeros:
+  the one with more digits is larger, and equal lengths compare lexically.
+  """
+  let numGt(a: String!, b: String!): Boolean! {
+    let da = a.split("").length
+    let db = b.split("").length
+    if (da != db) { da > db } else { a > b }
+  }
+}

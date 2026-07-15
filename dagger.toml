@@ -19,3 +19,8 @@ path = "."
 # projects under .dagger/modules/e2e/modules.
 [modules.e2e]
 source = ".dagger/modules/e2e"
+
+# Maintenance tasks: resolve the latest stable Deno release and bump the module's
+# pinned default version (deno.dang + README.md) as a reviewable changeset.
+[modules.maintenance]
+source = ".dagger/modules/maintenance"
