@@ -1,6 +1,6 @@
 # Design: `dagger/deno` — a Dagger module for Deno projects
 
-· Status: **draft / for review** 
+· Status: **in progress** (v0.1 shipped — see §0 / §9) 
 · SDK: **Dang** 
 · Module name: **`deno`** 
 · Root type: **`Deno`**
@@ -14,6 +14,53 @@ dependencies, reviewable diffs, and monorepo/workspace awareness.
 Follows the rubric in [`hacks/ideal-dagger-primitive-module.md`](../hacks/ideal-dagger-primitive-module.md).
 Modeled on [`dagger/go`](https://github.com/dagger/go) (advanced, workspace-aware)
 and [`dagger/node`](https://github.com/dagger/node) (simple, composable).
+
+---
+
+## 0. Implementation status (v0.1, shipped)
+
+`deno.dang` (root `Deno`) + `deno-project.dang` (`DenoProject`); e2e tests in
+`.dagger/modules/e2e`. Engine target **v1.0.0-beta.6**. Deltas from the sections
+below, learned while building against a real engine:
+
+- **`compile` output arg renamed `output` → `outputName`** — a function arg named
+  `output` collides with `dagger call`'s global `-o/--output` flag.
+- **`test` permissions come from `deno.json`, not Dagger args** — `test` takes no
+  permission arguments; on Deno >= 2.5.0 it runs `deno test -P`, so the project's
+  `test.permissions` (or a top-level permission set) governs what tests may do.
+  One source of truth, identical locally / in CI / here. Config permission sets +
+  `-P` landed in **2.5.0** (2.1.4/2.2/2.3/2.4 reject `-P` outright), so the default
+  `version` is pinned to **2.9.3**; if a caller overrides `version` below 2.5.0,
+  `test` **falls back to `-A`** (grant all) rather than send the unsupported flag,
+  gated by a numeric major.minor compare on `version`. **`compile` mirrors this**:
+  it also takes no permission args and bakes the deno.json default set via `-P`
+  (`compile` reads the top-level `permissions.default` set, whereas `test` reads
+  `test.permissions`). Its pre-2.5.0 fallback differs deliberately — it bakes
+  **no** permissions rather than force `-A` into a *shipped* artifact.
+- **`audit` not implemented** — deferred (out of scope); wiring `deno audit` is a
+  TODO, no longer blocked by the pinned version.
+- **`install` needs a glibc base** — the `denoland/deno:bin` binary is
+  glibc-linked; for musl/alpine use the default `base`.
+- **`Workspace!` is auto-injected** as `currentWorkspace` (no `--ws` arg); the
+  `ws`-passing model works transparently on the CLI and in `dagger check`.
+- **Discovery is relative to the caller's location** (shykes review): `projects(ws)`
+  globs `**/deno.json(c)` from `.` (self + descendants) **and** walks up to the
+  workspace root (ancestors as `..`-relative paths), excluding node_modules. See §7.
+- **Workspace-wide verbs shipped (v0.2 brought forward)** so the install DX works:
+  `lintAll`/`testAll`/`typeCheckAll`/`formatCheckAll` (`@check`) and `formatAll`
+  (`@generate`), run on the **caller's cone** (self + descendants, not ancestors).
+  After `dagger install github.com/dagger/deno`,
+  `dagger check` auto-runs all of them and `dagger generate` runs `formatAll`
+  (which also surfaces as a check — a stale-format guard) — verified end-to-end.
+  Decision: **aggregate `*All`**, not one auto-check per project (that's what
+  Dagger surfaces cleanly today).
+- **`test` uses `--permit-no-files`** so a project with no test files is a pass,
+  not a `deno test` error (matters for `testAll` across a mixed workspace).
+- **Resolved to-verify:** installed multi-file Dang modules with `Workspace` args
+  **work** on beta.6 (dagger/dagger#13476 no longer blocks the split); the `base`
+  constructor-field default (references `version`, mounts a `cacheVolume`) works
+  — though the `DENO_DIR` cache mount now lives in `container(ws)` so a custom
+  `base` keeps caching.
 
 ---
 
@@ -119,10 +166,10 @@ commands out:
 Deno                       (toolchain config: version, base)
  ├─ version, base          constructor inputs (base derived from version)
  ├─ install(ctr)           install the Deno CLI + cache into any container
- ├─ projects(ws)           discover every deno.json(c) → [DenoProject]
+ ├─ projects(ws)           discover from cwd: self + descendants + ancestors → [DenoProject]
  ├─ project(ws, path)      resolve the project containing a path
- ├─ lintAll/testAll/...    check every discovered project (@check)
- └─ formatAll(ws)          format every project → one Changeset (@generate)
+ ├─ lintAll/testAll/...    check every project in the caller's cone (@check)
+ └─ formatAll(ws)          format the caller's cone → one Changeset (@generate)
 
 DenoProject                (a project rooted at a workspace-relative path)
  ├─ path                   identity
@@ -150,9 +197,11 @@ The root type carries **only two** constructor inputs — `version` and `base`.
 Everything else is derived or scoped to the function that needs it. (In Dang the
 public fields of `Deno` *are* the constructor; see §6.)
 
-- **Version**: `version: String! = "2.1.4"` — pins the Deno release used for the
+- **Version**: `version: String! = "2.9.3"` — pins the Deno release used for the
   default base image. Pinned rather than a channel: reproducible, and the Dagger
-  lockfile picks up a bump on reload, so no tag drift.
+  lockfile picks up a bump on reload, so no tag drift. Defaults to a release with
+  config permission sets (`deno test -P`, added in 2.5.0); older overrides still
+  work, with `test` falling back to `-A` below 2.5.0 (see the Permissions bullet).
 - **Base**: `base: Container!` defaults to `denoland/deno:alpine-<version>` with
   `DENO_DIR` configured. Override it to bring your own image (distroless, an app
   image, a specific `alpine`/`debian`/`distroless` variant); it just needs `deno`
@@ -167,14 +216,24 @@ public fields of `Deno` *are* the constructor; see §6.)
   layer caches independently of source edits. This is internal to `base` /
   `install` / `container` — there is no public `withCache` knob.
 - **Permissions**: Deno's explicit-permission model is a real differentiator, but
-  it is only relevant to the functions that run code. `test` and `compile` take
-  their own `permissions: [String!]!` (e.g. `["--allow-net", "--allow-read"]`)
-  plus an `allowAll: Boolean! = false` convenience for `-A` — **not** global
-  config on the root.
-- **No selection config**: bulk verbs run across every discovered project.
-  Consumers scope by calling `project(ws, path)` directly or filtering the
-  `projects(ws)` list. (Gitignore-style selection can return later if a real need
-  appears; it isn't worth the constructor surface up front.)
+  it is only relevant to the functions that run code — and never global config on
+  the root.
+  - **`test`**: permissions come entirely from the project's `deno.json`
+    (`test.permissions`, or a top-level set). `test` takes **no** permission
+    arguments; on Deno >= 2.5.0 it runs `deno test -P`, which activates the config
+    set. One source of truth that applies identically at your desk (`deno test
+    -P`), in CI, and here — a per-project permission policy that lives with the
+    project, not scattered across `dagger call` invocations. Below 2.5.0 (no `-P`)
+    it falls back to `-A`, so an older overridden toolchain still runs.
+  - **`compile`**: same model, also no permission arguments. `deno compile -P`
+    bakes the deno.json **`permissions.default`** set into the binary (a runnable
+    app's default runtime permissions — a different config key than `test`'s
+    `test.permissions`). Below 2.5.0 it bakes **no** permissions rather than force
+    `-A` into a shipped binary (its fallback deliberately differs from `test`'s).
+- **No selection config**: bulk verbs run across the caller's cone (self +
+  descendants); scoping is done by *where you invoke* `dagger` (the current
+  location), or by calling `project(ws, path)` directly. (Gitignore-style selection
+  can return later if a real need appears; not worth the constructor surface up front.)
 
 ---
 
@@ -198,8 +257,8 @@ https://deno.com
 type Deno {
   # ---- constructor inputs (become the generated `deno(...)` args) ----
 
-  "Deno version used for the default base image."
-  version: String!            # default "2.1.4"
+  "Deno version for the default base image (>= 2.5.0 uses `test`'s `-P`, else `-A`)."
+  version: String!            # default "2.9.3"
 
   """
   Base container for Deno commands. Defaults to denoland/deno:<version> with the
@@ -221,32 +280,35 @@ type Deno {
   # ---- discovery & lookup ----
 
   """
-  Every Deno project discovered in the workspace: each deno.json(c), plus each
-  member listed in a root deno.json `workspace` array.
+  Every Deno project visible from the caller's location: the projects at and under
+  the current workspace location (`.`), plus the ancestor projects walking up to
+  the workspace root. Paths are relative to the current location (`.`, `sub`, `..`,
+  `../..`). node_modules is excluded.
   """
   projects(ws: Workspace!): [DenoProject!]!
 
   """
   The Deno project containing `path`. With findUp (default) `path` may be any
   directory inside a project and snaps to its root; set findUp: false when
-  `path` is already a project root.
+  `path` is already a project root (used as given, not normalized).
   """
   project(ws: Workspace!, path: String!, findUp: Boolean! = true): DenoProject!
 
   # ---- workspace-wide checks ----
-  # One aggregate check per verb today; see §10 "To verify" on whether the API
-  # can instead surface one check *per project* automatically.
+  # These run on the caller's CONE only — its own project plus descendants, never
+  # the ancestors `projects` lists (a check/generate shouldn't reach up into a
+  # parent project, and a cwd-rooted changeset can't represent changes above it).
 
-  "Lint every discovered project."
+  "Lint every project in the caller's cone."
   lintAll(ws: Workspace!): Void @check
-  "Test every discovered project."
+  "Test every project in the caller's cone."
   testAll(ws: Workspace!): Void @check
-  "Type-check every discovered project."
+  "Type-check every project in the caller's cone."
   typeCheckAll(ws: Workspace!): Void @check
-  "Check formatting of every discovered project."
+  "Check formatting of every project in the caller's cone."
   formatCheckAll(ws: Workspace!): Void @check
 
-  "Format every discovered project; returns one reviewable changeset."
+  "Format every project in the caller's cone; returns one reviewable changeset."
   formatAll(ws: Workspace!): Changeset! @generate
 }
 ```
@@ -274,10 +336,11 @@ type DenoProject {
   "Lint this project (`deno lint`)."
   lint(ws: Workspace!): Void @check
   """
-  Run this project's tests (`deno test`). `permissions`/`allowAll` control the
-  granted Deno permissions.
+  Run this project's tests. Permissions come from the project's deno.json
+  (`test.permissions` / a top-level set) via `deno test -P`, not from arguments;
+  below Deno 2.5.0 (no `-P`) it falls back to `-A`.
   """
-  test(ws: Workspace!, permissions: [String!]! = [], allowAll: Boolean! = false): Void @check
+  test(ws: Workspace!): Void @check
   "Type-check without running (`deno check`)."
   typeCheck(ws: Workspace!): Void @check
   "Check formatting without writing (`deno fmt --check`)."
@@ -293,16 +356,15 @@ type DenoProject {
   # ---- build artifact (plain output, not a verb — see §3) ----
   """
   Compile a standalone executable (`deno compile`). `target` cross-compiles
-  (e.g. "x86_64-unknown-linux-gnu"); null uses the base image's platform.
-  `permissions`/`allowAll` bake default permissions into the binary.
+  (e.g. "x86_64-unknown-linux-gnu"); null uses the base image's platform. Baked-in
+  permissions come from the deno.json `permissions.default` set via `-P` (no
+  permission args); below Deno 2.5.0 the binary bakes no permissions.
   """
   compile(
     ws: Workspace!
     entrypoint: String! = "main.ts"
-    output: String! = "app"
+    outputName: String! = "app"   # not `output`: clashes with dagger's -o/--output
     target: String = null
-    permissions: [String!]! = []
-    allowAll: Boolean! = false
   ): File!
 
   # No @up: downstream modules add their own `serve(): Service! @up` on top of
@@ -320,7 +382,7 @@ public fields, so Dang generates `deno(version:, base:)` with no `new`):
 ```dang
 # deno.dang
 type Deno {
-  pub version: String! = "2.1.4"
+  pub version: String! = "2.9.3"
   pub base: Container! =
     container.from("denoland/deno:alpine-" + version)
       .withEnvVariable("DENO_DIR", "/deno-dir")
@@ -354,6 +416,23 @@ Unlike Go, a Deno project's source *is* its directory: there's no in-tree
 `node_modules` and the dependency cache lives outside the tree in `DENO_DIR`, so
 no include-graph discovery is required.
 
+**Discovery is relative to the caller's location, not the workspace root.**
+`projects` globs `**/deno.json(c)` from `.` (the current workspace location, so
+paths come back relative to it) **and** walks up to the workspace root, adding
+each ancestor project as a `..`-relative path. Two facts drive this (both verified
+against the engine): `ws.directory(path)` resolves *relative* paths from the
+current location and *absolute* (`/…`) paths from the root; and `ws.cwd` gives the
+current location (`/`, `/sub`, …), whose depth bounds the up-walk. So from `/sub`
+with `/deno.json` + `/sub/deno.json`, `projects` returns `.` and `..`; from the
+root it returns `.` and `sub`.
+
+The **workspace-wide verbs run on the cone only** — the caller's own project plus
+descendants (paths without a `..`), never the ancestors. A `@check` shouldn't
+reach up into a parent project you're nested inside, and a `Changeset` rooted at
+the caller's location can't represent changes *above* it (a `..` path collapses).
+So `projects`/`workspaces` list ancestors for context, but `lintAll` … `formatAll`
+filter to `inCone(dir) = !dir.hasPrefix("..")`.
+
 **`container` — cache deps independently of source (manifests first):**
 
 ```dang
@@ -384,15 +463,24 @@ workspace-relative. Multi-project generate must re-root each project's changes
 at its `path` before merging (the `dagger/go` `generateAll` pattern) — a phase-2
 concern.
 
-**`test` — permissions assembled from args:**
+**`test` — permissions sourced from `deno.json` via `-P` (no args), with an `-A`
+fallback for pre-2.5.0 toolchains:**
 
 ```dang
-pub test(ws: Workspace!, permissions: [String!]! = [], allowAll: Boolean! = false): Void @check {
-  let perms = if (allowAll) { ["-A"] } else { permissions }
-  container(ws).withExec(["deno", "test"] + perms).sync
+pub test(ws: Workspace!): Void @check {
+  # -P applies deno.json's test.permissions (>= 2.5.0); older Deno lacks -P, so
+  # fall back to -A. --permit-no-files makes an empty project a pass.
+  let permissionFlag = if (supportsPermissionSets()) { "-P" } else { "-A" }
+  container(ws).withExec(["deno", "test", "--permit-no-files", permissionFlag]).sync
   null
 }
+
+# supportsPermissionSets parses version's major.minor: major > 2, or major == 2
+# and minor >= 5. DenoProject carries `version` from the root for this gate.
 ```
+
+`-P` with no permission config in `deno.json` is safe (grants nothing, no error),
+so it is passed unconditionally.
 
 **File layout (multi-file module):** split by type — `deno.dang` (root `Deno`),
 `deno-project.dang` (`DenoProject`), and future types each in their own file. All
@@ -416,10 +504,10 @@ Downstream authors `dagger install github.com/dagger/deno`, then call `deno(...)
 type MyApp {
   "Full CI for this app: reuse the deno module's checks, add our own."
   pub ci(ws: Workspace!): Void @check {
-    let project = deno(version: "2.1.4").project(ws, ".")
+    let project = deno(version: "2.9.3").project(ws, ".")
     project.lint(ws)
     project.typeCheck(ws)
-    project.test(ws, allowAll: true)
+    project.test(ws)   # permissions come from deno.json's test.permissions
     smokeTest(ws)   # our own extra check
   }
 
@@ -449,14 +537,33 @@ supplying the `@up` service the base module intentionally leaves to them.
 
 ## 9. Phasing
 
-1. **v0.1** — root `Deno` (`version`, `base`, `install`), single-project via
-   `project(ws, ".")`, checks (`lint`/`test`/`typeCheck`/`formatCheck`/`audit`),
-   `format` generator, `compile`. Multi-file layout (`deno.dang`,
-   `deno-project.dang`) from the start. Ship the composable primitives first.
-2. **v0.2** — multi-project discovery (`projects`, `deno.json` `workspace`
-   members), `*All` bulk verbs, native helper for `workspace` parsing.
-3. **later** — `coverage`/`bench` once Dagger has the DX to surface reports;
-   `publish` (JSR, secret auth); Deno Deploy.
+**v0.1 — shipped**
+
+- [x] root `Deno`: `version`, `base`, `install(ctr)`
+- [x] single-project lookup: `project(ws, path, findUp)` (find-up to nearest deno.json/deno.jsonc)
+- [x] checks: `lint` / `test` (`deno test -P`, permissions from deno.json) / `typeCheck` / `formatCheck`
+- [x] `format` generator (`@generate` → changeset)
+- [x] `compile` (→ `File!`)
+- [x] introspection: `config` / `source` / `container`
+- [x] multi-file layout (`deno.dang`, `deno-project.dang`)
+- [x] e2e tests (`.dagger/modules/e2e`) + `README.md`
+- [x] discovery relative to the caller's location: `projects(ws)` = self + descendants
+      (glob from `.`) + ancestors (walk up to the workspace root), cwd-relative paths
+- [x] `*All` bulk verbs: `lintAll`/`testAll`/`typeCheckAll`/`formatCheckAll` + `formatAll`
+      generator, scoped to the caller's cone (ancestors excluded)
+- [x] install DX: `dagger check` / `dagger generate` auto-run the `*All` verbs
+- [x] decision: aggregate `*All` (not one auto-check per project)
+- [x] `test` permissions sourced from `deno.json` via `deno test -P` (no Dagger
+      args); default `version` bumped to `2.9.3`, with an `-A` fallback below 2.5.0
+- [ ] ~~`audit`~~ — deferred (out of scope); no longer version-blocked
+
+**v0.2 / later**
+
+- [ ] `deno.json` `workspace`-array-aware grouping (native helper); today each
+      deno.json is discovered independently by glob
+- [ ] `coverage` / `bench` once Dagger has the DX to surface reports
+- [ ] `audit` — wire `deno audit` (now available in the pinned version)
+- [ ] `publish` (JSR, secret auth); Deno Deploy
 
 ## 10. Decisions & things to verify
 
@@ -465,8 +572,13 @@ supplying the `@up` service the base module intentionally leaves to them.
 - **Pin `version`** to an exact release; rely on the Dagger lockfile to pick up a
   tag change on reload (no channel).
 - **`ws`-passing model** (no stored `source`), workspace-first for monorepos.
-- **Permissions** are a `[String!]!` + `allowAll`, **scoped to `test`/`compile`**,
-  not root config.
+- **`test` and `compile` permissions live in `deno.json`** (`-P`), never in Dagger
+  args — one policy shared across desk/CI/module. `test` reads `test.permissions`,
+  `compile` bakes the top-level `permissions.default` set. Never root config
+  either way. (Superseded the earlier "`permissions` scoped to `test`/`compile`"
+  arg-based decision — both are now config-driven; the default `version` is `2.9.3`
+  for `-P`, with `test` falling back to `-A` and `compile` to no permissions on
+  overrides below 2.5.0.)
 - **No dependency-edit functions** (`add`/`remove`/`outdated`): they'd just wrap
   the CLI with no added value.
 - **Multi-file module** (`deno.dang`, `deno-project.dang`, …).
@@ -475,20 +587,18 @@ supplying the `@up` service the base module intentionally leaves to them.
 
 **To verify (before/while building):**
 
-- **Per-project checks**: can the Dagger API surface **one check per discovered
-  project automatically** (each project as its own `dagger check` entry), instead
-  of a single aggregate `lintAll`/`testAll`? Investigate `Workspace.checks` /
-  check-group registration and whether a `@check` can fan out dynamically. If it
-  can, prefer per-project checks over the `*All` aggregates.
-- **Installed multi-file Dang modules with `Workspace` args**: `dagger/go`
-  deliberately kept one `.dang` file pending Dagger v0.21 (dagger/dagger#13476 —
-  `Workspace` arg conversion for installed multi-file Dang toolchains). Confirm
-  this works on our target engine before relying on the multi-file split for an
-  *installed* module.
-- **`base` field default**: confirm a stored constructor-field default may build
-  a `Container!` that references another field (`version`) and mounts a
-  `cacheVolume` (expected per Dang `objects.md`, but verify on the engine). If
-  not, move the wiring into an explicit `new`.
+- ~~**Per-project checks**~~ — **decided**: ship aggregate `*All` verbs
+  (`lintAll`/`testAll`/…). They surface cleanly as one `dagger check` entry each
+  and auto-run after install. Whether a single `@check` can fan out into one
+  entry *per* discovered project is still an open Dagger-API question, but the
+  aggregate is the right v0.2 shape and works today.
+- ~~**Installed multi-file Dang modules with `Workspace` args**~~ — **resolved**:
+  works on v1.0.0-beta.6. The e2e module installs the multi-file `deno` module and
+  drives its `Workspace`-taking functions; dagger/dagger#13476 no longer blocks
+  the split.
+- ~~**`base` field default**~~ — **resolved**: a constructor-field default that
+  references `version` and mounts a `cacheVolume` works. (The `DENO_DIR` cache
+  mount was moved into `container(ws)` so a custom `base` still gets caching.)
 - **Source over-mounting**: `source = ws.directory(path)` includes the whole
   subtree (good for runtime-read assets/testdata) — confirm we don't need
   targeted excludes for large data dirs.

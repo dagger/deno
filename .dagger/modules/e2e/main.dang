@@ -1,0 +1,211 @@
+"""
+End-to-end checks for the Deno module.
+
+Each check drives the installed `deno` dependency against a small sample project
+under `.dagger/modules/e2e/modules`.
+"""
+type E2e {
+  let modulesRoot: String! = ".dagger/modules/e2e/modules"
+  let helloPath: String! = modulesRoot + "/hello"
+  let fmtDirtyPath: String! = modulesRoot + "/fmt-dirty"
+  let withDepsPath: String! = modulesRoot + "/with-deps"
+  let permNetPath: String! = modulesRoot + "/perm-net"
+  let permAppPath: String! = modulesRoot + "/perm-app"
+
+  """
+  Fail the current check when a condition is false.
+  """
+  let assert(condition: Boolean!, message: String!): Void {
+    if (condition == false) {
+      raise message
+    }
+    null
+  }
+
+  """
+  Return true when a list contains the exact string.
+  """
+  let contains(values: [String!]!, want: String!): Boolean! {
+    values.filter { value => value == want }.length > 0
+  }
+
+  """
+  Discovery + workspace-wide verbs: formatCheckAll fails because the discovered
+  fmt-dirty fixture is unformatted, and formatAll's changeset includes it.
+  """
+  pub discoveryCheck(ws: Workspace!): Void @check {
+    let formatFailed = try {
+      deno().formatCheckAll(ws)
+      false
+    } catch {
+      err => true
+    }
+    assert(formatFailed, "formatCheckAll did not fail; discovery missed the unformatted fixture")
+
+    let changes = deno().formatAll(ws)
+    assert(
+      contains(changes.modifiedPaths, fmtDirtyPath + "/main.ts"),
+      "formatAll changeset did not include the discovered fmt-dirty project",
+    )
+    null
+  }
+
+  """
+  All happy-path checks pass on a clean, well-formatted project.
+  """
+  pub cleanProjectCheck(ws: Workspace!): Void @check {
+    let project = deno().project(ws, helloPath)
+    project.lint(ws)
+    project.typeCheck(ws)
+    project.formatCheck(ws)
+    project.test(ws)
+    null
+  }
+
+  """
+  Project lookup snaps a nested path to the owning project root, and findUp:false
+  keeps an exact root untouched.
+  """
+  pub projectLookupCheck(ws: Workspace!): Void @check {
+    let nested = deno().project(ws, helloPath + "/nested")
+    let exact = deno().project(ws, helloPath, findUp: false)
+    assert(nested.path == helloPath, "find-up lookup returned wrong path: " + nested.path)
+    assert(exact.path == helloPath, "exact lookup returned wrong path: " + exact.path)
+    null
+  }
+
+  """
+  format returns a non-empty changeset on a badly formatted project, touching
+  only that project's files; formatCheck fails on the same project.
+  """
+  pub dirtyProjectCheck(ws: Workspace!): Void @check {
+    let project = deno().project(ws, fmtDirtyPath)
+    let changes = project.format(ws)
+
+    assert(changes.isEmpty == false, "format produced no diff on a badly formatted project")
+    assert(
+      contains(changes.modifiedPaths, fmtDirtyPath + "/main.ts"),
+      "format diff did not modify the project's main.ts",
+    )
+
+    let formatCheckFailed = try {
+      project.formatCheck(ws)
+      false
+    } catch {
+      err => true
+    }
+    assert(formatCheckFailed, "formatCheck did not fail on a badly formatted project")
+    null
+  }
+
+  """
+  install adds a working Deno CLI to a bare glibc base image.
+  """
+  pub installCheck(): Void @check {
+    let version = deno()
+      .install(container.from("debian:stable-slim"))
+      .withExec(["deno", "--version"])
+      .stdout
+    assert(version.contains("deno 2"), "install did not produce a working deno: " + version)
+    null
+  }
+
+  """
+  A project with a jsr dependency type-checks and tests (exercises the dependency
+  cache path).
+  """
+  pub withDepsCheck(ws: Workspace!): Void @check {
+    let project = deno().project(ws, withDepsPath)
+    project.typeCheck(ws)
+    project.test(ws)
+    null
+  }
+
+  """
+  Test permissions come from deno.json, not from Dagger arguments. `test` runs
+  `deno test -P`, so a project that declares `test.permissions` in deno.json has
+  those permissions granted — and the same container without `-P` fails, proving
+  the flag is what activates the config.
+  """
+  pub permissionCheck(ws: Workspace!): Void @check {
+    let project = deno().project(ws, permNetPath)
+    # The module runs `deno test -P`, so net (declared in deno.json) is granted.
+    project.test(ws)
+
+    # Without -P, deno refuses config permissions — proves -P is load-bearing.
+    let withoutPermissionFlagFailed = try {
+      project.container(ws).withExec(["deno", "test", "--permit-no-files"]).sync
+      false
+    } catch {
+      err => true
+    }
+    assert(
+      withoutPermissionFlagFailed,
+      "deno test without -P should fail when permissions live in deno.json",
+    )
+    null
+  }
+
+  """
+  On a Deno older than 2.5.0 there is no `-P`, so `test` must fall back to `-A`
+  rather than send the unsupported flag. Running `test` with an overridden 2.4.0
+  toolchain passes only because of that fallback — sending `-P` would make deno
+  2.4.0 fail with "unexpected argument '-P'".
+  """
+  pub legacyVersionCheck(ws: Workspace!): Void @check {
+    deno(version: "2.4.0").project(ws, helloPath).test(ws)
+    null
+  }
+
+  """
+  `compile` bakes the deno.json default permission set into the binary via `-P`,
+  just like `test`. The perm-app fixture declares a top-level `permissions.default`
+  with net, so the compiled binary reports net as granted when run — without `-P`
+  it would report `prompt`.
+  """
+  pub compilePermissionCheck(ws: Workspace!): Void @check {
+    let bin = deno().project(ws, permAppPath).compile(ws, entrypoint: "main.ts")
+    let output = container
+      .from("debian:stable-slim")
+      .withFile("/app", bin, permissions: 493)
+      .withExec(["/app"])
+      .stdout
+    assert(
+      output.contains("NET:granted"),
+      "compiled binary did not bake net permission from deno.json: " + output,
+    )
+    null
+  }
+
+  """
+  The workspace-wide verbs run on the caller's cone (its own project + descendants),
+  never on ancestor projects reached by walking up — even though those ancestors are
+  still listed by `projects`.
+  """
+  pub subdirScopeCheck(): Void @check {
+    # Ancestor is skipped: dirty root, clean sub. From `/sub` the root is an ancestor,
+    # so formatCheckAll ignores it and passes (sub is clean).
+    let dirtyAncestor = directory
+      .withNewFile("deno.json", "{}\n")
+      .withNewFile("mod.ts", "export function f(a:number){return a}\n")
+      .withNewFile("sub/deno.json", "{}\n")
+      .withNewFile("sub/mod.ts", "export const ok = 1;\n")
+    assert(
+      try { deno().formatCheckAll(dirtyAncestor.asWorkspace(cwd: "sub")); true } catch { err => false },
+      "from /sub: checks must skip the ancestor root, so a dirty ancestor does not fail them",
+    )
+
+    # Cone is covered: clean root, dirty sub. From `/sub`, sub is the caller's own
+    # project, so formatCheckAll checks it and fails.
+    let dirtySub = directory
+      .withNewFile("deno.json", "{}\n")
+      .withNewFile("mod.ts", "export const ok = 1;\n")
+      .withNewFile("sub/deno.json", "{}\n")
+      .withNewFile("sub/mod.ts", "export function f(a:number){return a}\n")
+    assert(
+      try { deno().formatCheckAll(dirtySub.asWorkspace(cwd: "sub")); false } catch { err => true },
+      "from /sub: checks must cover the caller's own project, so a dirty sub fails them",
+    )
+    null
+  }
+}

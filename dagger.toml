@@ -14,3 +14,8 @@ name = "dang"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "."
+
+# End-to-end tests: installs the deno module and drives it against the sample
+# projects under .dagger/modules/e2e/modules.
+[modules.e2e]
+source = ".dagger/modules/e2e"

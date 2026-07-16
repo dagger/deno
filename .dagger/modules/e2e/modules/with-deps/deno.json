@@ -1,0 +1,7 @@
+{
+  "name": "@e2e/with-deps",
+  "version": "0.1.0",
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1.0.0"
+  }
+}
