@@ -19,6 +19,10 @@ get:
   and PR bots). And because Dagger surfaces every `@generate` as a check as well,
   a formatting generator doubles as an "is formatting up to date?" check — CI
   fails when the output drifts, with no extra wiring.
+- **Monorepo-aware** — a Deno [workspace](https://docs.deno.com/runtime/fundamentals/workspaces/)
+  (a root `deno.json` with a `workspace` array) is a first-class object: checks
+  fan out across every member, and a single member's checks still resolve the
+  shared lockfile, import map, and sibling packages.
 - **Composability** — install Deno into any container, produce standalone
   binaries, and extend it from your own module.
 
@@ -47,8 +51,9 @@ dagger install github.com/dagger/deno
 This adds a `[modules.deno]` entry to your `dagger.toml`. Configure the toolchain
 there (or with `dagger settings`), e.g. `settings.version = "2.9.3"`.
 
-**2. Run checks and generators** across every Deno project in the workspace
-(each `deno.json`/`deno.jsonc` is discovered automatically):
+**2. Run checks and generators** across everything in the workspace — every
+standalone `deno.json`/`deno.jsonc` *and* every Deno workspace (a `deno.json`
+`workspace` array), discovered automatically:
 
 ```sh
 dagger check      # deno:lint-all, test-all, type-check-all, format-check-all
@@ -74,6 +79,36 @@ dagger call deno project --path apps/api type-check
 > Don't want to install? Run any command one-off with
 > `dagger -m github.com/dagger/deno call …` instead of `dagger call deno …`.
 
+## Monorepos (Deno workspaces)
+
+A [Deno workspace](https://docs.deno.com/runtime/fundamentals/workspaces/) — a
+root `deno.json` with a `workspace` array of member packages sharing one
+`deno.lock` and import map — is modeled as a `workspace` object. Its checks run a
+single `deno` command at the root, so the toolchain fans out across every member:
+
+```sh
+# run all members' checks at once (deno fans out from the root)
+dagger call deno workspace --path . lint
+dagger call deno workspace --path . test --allow-all
+dagger call deno workspace --path . type-check
+
+# list the discovered members
+dagger call deno workspace --path . members
+```
+
+To work on **one** member, use `project` with the member's path — the container
+mounts the whole workspace root (so the shared lockfile and sibling `@scope/pkg`
+imports resolve) and scopes the command to that member:
+
+```sh
+dagger call deno project --path packages/api test
+dagger call deno project --path packages/api workspace-root   # -> the workspace root
+```
+
+`dagger check` / `dagger generate` handle the mix automatically: each discovered
+workspace is checked (with `deno` fanning out) and each standalone project is
+checked on its own — members are never run twice.
+
 ## Functions
 
 ### Checks (`dagger check`)
@@ -85,9 +120,11 @@ dagger call deno project --path apps/api type-check
 | `project … type-check` | `deno check` |
 | `project … format-check` | `deno fmt --check` |
 
-Each has a workspace-wide counterpart on the root — `lint-all`, `test-all`,
-`type-check-all`, `format-check-all` — that runs it across every discovered
-project. Those are what `dagger check` invokes.
+The same four checks exist on `workspace …` (running across every member of a
+Deno workspace at once). And each has a workspace-wide counterpart on the root —
+`lint-all`, `test-all`, `type-check-all`, `format-check-all` — that runs it across
+every discovered workspace and standalone project. Those are what `dagger check`
+invokes.
 
 Tests often need permissions. Those come from the **project's `deno.json`**, not
 from Dagger flags: `test` always runs `deno test -P`, which applies the config's
@@ -228,13 +265,13 @@ type MyApp {
 
 ## Development
 
-The module is split into `deno.dang` (root `Deno` type) and `deno-project.dang`
-(`DenoProject`).
+The module is split into `deno.dang` (root `Deno` type), `deno-project.dang`
+(`DenoProject`), and `deno-workspace.dang` (`DenoWorkspace`).
 
 End-to-end tests live in [`.dagger/modules/e2e`](./.dagger/modules/e2e): a Dang
 module that installs this module and drives it against the sample projects under
-`.dagger/modules/e2e/modules` (a clean project, a badly formatted one, and one
-with a jsr dependency).
+`.dagger/modules/e2e/modules` (a clean project, a badly formatted one, one with a
+jsr dependency, and a Deno workspace with two members that import each other).
 
 ```sh
 # run the e2e checks

@@ -1,6 +1,6 @@
 # Design: `dagger/deno` — a Dagger module for Deno projects
 
-· Status: **in progress** (v0.1 shipped — see §0 / §9) 
+· Status: **in progress** (v0.1 + v0.2 workspace support shipped — see §0 / §9) 
 · SDK: **Dang** 
 · Module name: **`deno`** 
 · Root type: **`Deno`**
@@ -61,6 +61,46 @@ below, learned while building against a real engine:
   constructor-field default (references `version`, mounts a `cacheVolume`) works
   — though the `DENO_DIR` cache mount now lives in `container(ws)` so a custom
   `base` keeps caching.
+
+## 0.1 Implementation status (v0.2 — Deno workspaces, shipped)
+
+Adds true [Deno workspace](https://docs.deno.com/runtime/fundamentals/workspaces/)
+(monorepo) awareness — a root `deno.json` with a `workspace` array of members
+sharing one `deno.lock` and import map. New file `deno-workspace.dang`
+(`DenoWorkspace`). Deltas learned building against the engine:
+
+- **The correctness fix**: a workspace member's `container(ws)` now mounts the
+  **workspace root** (whole tree) and sets the workdir to the member's
+  subdirectory, instead of mounting the member subtree alone. `deno` then walks
+  up to the shared `deno.lock` / import map and resolves sibling members — so a
+  member's `test`/`typeCheck`/`lint` actually pass. The pre-v0.2 per-member mount
+  failed on any cross-member import (proven by the `workspace-member-check` e2e).
+- **Leverage `deno`'s native fan-out** instead of iterating members: `deno
+  lint`/`test`/`check`/`fmt` run at the workspace root already traverse every
+  member honoring the exact `workspace` config. So `DenoWorkspace`'s checks are a
+  **single exec at the root**, not a per-member `reduce` loop (the `dagger/go`
+  `*All` ceremony is unnecessary here — Go has no root fan-out).
+- **JSON parsed in-language with `JSON.decode`** — no native Go binary. The design
+  anticipated a helper (§6/§7); Dang's type-driven `JSON.decode(text)` decoding into
+  a `DenoConfig { workspace: [String!]! }` record reads the `workspace` array
+  directly from `File.contents`. (Use the `JSON` namespace — `JSON.decode` /
+  `JSON.encode` — never the bare `fromJSON`/`toJSON`.) **Edge**: `JSON.decode` is
+  strict JSON, so a `deno.jsonc` root config with comments/trailing commas doesn't
+  parse — root detection falls back to a `"workspace"`-key substring check
+  (`isWorkspaceRoot`). Root configs are near-always trivial strict JSON, a
+  documented corner.
+- **Discovery partitions** every `deno.json(c)` into: workspace **roots**
+  (`workspaces(ws)`), **members** (reached via a workspace's `members(ws)`), and
+  **standalone** projects (`projects(ws)`). `*All` iterates roots (fan-out) +
+  standalone, so members are never double-run. `project(ws, path)` resolves a
+  member's `workspaceRoot` by walking ancestors, so single-member targeting works.
+- **Engine gotcha (e2e only)**: a **cross-module** object list returned by an
+  installed dependency (`deno().workspaces(ws)` in the e2e module) is a lazy
+  `GraphQL[T!]` that can't be `map`/`filter`/`length`/indexed until materialized,
+  and `.{field}` materialization of dependency module-object lists is unreliable
+  on beta.6. E2e checks therefore assert workspace behavior through **scalar**
+  reads (`.path`, `.workspaceRoot`) + `@check` runs; the exact discovery partition
+  (`projects` = 3 standalone, root + 2 members excluded) was verified same-module.
 
 ---
 
@@ -166,16 +206,27 @@ commands out:
 Deno                       (toolchain config: version, base)
  ├─ version, base          constructor inputs (base derived from version)
  ├─ install(ctr)           install the Deno CLI + cache into any container
- ├─ projects(ws)           discover from cwd: self + descendants + ancestors → [DenoProject]
- ├─ project(ws, path)      resolve the project containing a path
- ├─ lintAll/testAll/...    check every project in the caller's cone (@check)
+ ├─ workspaces(ws)         discover workspace roots (from cwd: self+descendants+ancestors) → [DenoWorkspace]
+ ├─ workspace(ws, path)    resolve the workspace containing a path
+ ├─ projects(ws)           discover STANDALONE deno.json(c) (from cwd, same reach) → [DenoProject]
+ ├─ project(ws, path)      resolve the project containing a path (+ its workspace root)
+ ├─ lintAll/testAll/...    check the caller's cone: workspaces (fan-out) + standalone (@check)
  └─ formatAll(ws)          format the caller's cone → one Changeset (@generate)
+
+DenoWorkspace              (a monorepo: root deno.json with a `workspace` array)
+ ├─ path                   workspace root, identity
+ ├─ config(ws)             the root deno.json(c)
+ ├─ members(ws)            the member projects → [DenoProject]
+ ├─ source(ws)/container(ws)   the whole workspace, workdir at the root
+ ├─ lint/test/typeCheck/formatCheck(ws)  → Void @check  (one exec; deno fans out)
+ └─ format(ws)             → Changeset @generate         (deno fmt across all members)
 
 DenoProject                (a project rooted at a workspace-relative path)
  ├─ path                   identity
+ ├─ workspaceRoot          the workspace this project belongs to (== path if standalone)
  ├─ config(ws)             the deno.json(c) file
  ├─ source(ws)             the project's source subtree
- ├─ container(ws)          Deno + source + warmed DENO_DIR + deps installed
+ ├─ container(ws)          Deno + workspace-root mount + warmed DENO_DIR (workdir = member)
  ├─ lint/test/typeCheck/formatCheck/audit(ws)   → Void @check
  ├─ format(ws)             → Changeset @generate
  └─ compile(ws, ...)       → File   (standalone binary, on demand)
@@ -184,6 +235,13 @@ DenoProject                (a project rooted at a workspace-relative path)
 Two verbs are intentionally absent (see §3): there is no `@up` (no sensible
 default server for an arbitrary project — downstream modules add their own), and
 dependency edits are not generators (no value over the CLI).
+
+A `DenoProject` carries **two** identity fields: its own `path` and the
+`workspaceRoot` it belongs to. For a standalone project the two are equal and the
+container mounts just the project subtree; for a member the container mounts the
+workspace root and only moves the workdir, so `deno` resolves the shared lockfile
+and sibling members. `DenoWorkspace` is the monorepo peer of `DenoProject`: its
+checks run one `deno` command at the root and let the toolchain fan out.
 
 Every node answers a question a user (or agent) might ask. `path` is stored
 identity; everything workspace-derived takes `ws` explicitly so cache
@@ -280,35 +338,51 @@ type Deno {
   # ---- discovery & lookup ----
 
   """
-  Every Deno project visible from the caller's location: the projects at and under
-  the current workspace location (`.`), plus the ancestor projects walking up to
-  the workspace root. Paths are relative to the current location (`.`, `sub`, `..`,
-  `../..`). node_modules is excluded.
+  Every Deno workspace discovered: each directory whose deno.json declares a
+  `workspace` array of members. Discovered relative to the caller's location —
+  self + descendants + ancestors (see §7).
+  """
+  workspaces(ws: Workspace!): [DenoWorkspace!]!
+
+  """
+  The Deno workspace containing `path`. With findUp (default) `path` snaps up to
+  the nearest ancestor deno.json with a `workspace` array; set findUp: false when
+  `path` is already the workspace root.
+  """
+  workspace(ws: Workspace!, path: String!, findUp: Boolean! = true): DenoWorkspace!
+
+  """
+  Every STANDALONE Deno project discovered relative to the caller's location (self
+  + descendants + ancestors, paths cwd-relative: `.`, `sub`, `..`): each deno.json(c)
+  that is neither a workspace root nor a member of one (those are reached through
+  `workspaces` and a workspace's `members`). node_modules is excluded.
   """
   projects(ws: Workspace!): [DenoProject!]!
 
   """
   The Deno project containing `path`. With findUp (default) `path` may be any
   directory inside a project and snaps to its root; set findUp: false when
-  `path` is already a project root (used as given, not normalized).
+  `path` is already a project root (used as given, not normalized). The returned
+  project carries its resolved `workspaceRoot`, so a member's commands run against
+  the shared workspace.
   """
   project(ws: Workspace!, path: String!, findUp: Boolean! = true): DenoProject!
 
   # ---- workspace-wide checks ----
-  # These run on the caller's CONE only — its own project plus descendants, never
-  # the ancestors `projects` lists (a check/generate shouldn't reach up into a
-  # parent project, and a cwd-rooted changeset can't represent changes above it).
+  # Each verb runs across the caller's CONE — every workspace (deno fans out over
+  # its members) plus every standalone project, self + descendants, never the
+  # ancestors `projects`/`workspaces` list. Members are never double-run.
 
-  "Lint every project in the caller's cone."
+  "Lint every workspace and standalone project in the caller's cone."
   lintAll(ws: Workspace!): Void @check
-  "Test every project in the caller's cone."
+  "Test every workspace and standalone project in the caller's cone."
   testAll(ws: Workspace!): Void @check
-  "Type-check every project in the caller's cone."
+  "Type-check every workspace and standalone project in the caller's cone."
   typeCheckAll(ws: Workspace!): Void @check
-  "Check formatting of every project in the caller's cone."
+  "Check formatting of every workspace and standalone project in the caller's cone."
   formatCheckAll(ws: Workspace!): Void @check
 
-  "Format every project in the caller's cone; returns one reviewable changeset."
+  "Format every workspace and standalone project in the caller's cone; one changeset."
   formatAll(ws: Workspace!): Changeset! @generate
 }
 ```
@@ -320,15 +394,24 @@ type DenoProject {
   "Workspace-relative path of this project root."
   path: String!
 
+  """
+  Workspace-relative path of the Deno workspace root this project belongs to.
+  Equals `path` for a standalone project; for a member it is the directory
+  holding the root deno.json whose `workspace` array lists this member.
+  """
+  workspaceRoot: String!
+
   # ---- causal introspection ----
   "This project's deno.json / deno.jsonc file."
   config(ws: Workspace!): File!
   "This project's source directory (its subtree of the workspace)."
   source(ws: Workspace!): Directory!
   """
-  Container with Deno installed, DENO_DIR warmed, deps installed (`deno install`)
-  and this project's source mounted at the workdir. The base every verb builds
-  on, and the extension point for downstream modules.
+  Container with Deno installed and DENO_DIR warmed. For a standalone project the
+  project subtree is mounted at the workdir; for a workspace member the whole
+  workspace root is mounted and the workdir is set to the member subdirectory, so
+  `deno` resolves the shared deno.lock, import map, and sibling members. The base
+  every verb builds on, and the extension point for downstream modules.
   """
   container(ws: Workspace!): Container!
 
@@ -369,6 +452,43 @@ type DenoProject {
 
   # No @up: downstream modules add their own `serve(): Service! @up` on top of
   # `container(ws)`. See §8.
+}
+```
+
+### 6.3 `type DenoWorkspace` — the monorepo object
+
+A workspace root (a deno.json with a `workspace` array). Because `deno` fans a
+single command out across all members, every check here is **one exec at the
+root** — no per-member iteration.
+
+```graphql
+type DenoWorkspace {
+  "Workspace-relative path of the workspace root."
+  path: String!
+
+  # ---- causal introspection ----
+  "The root deno.json / deno.jsonc file."
+  config(ws: Workspace!): File!
+  "The member projects discovered under this workspace."
+  members(ws: Workspace!): [DenoProject!]!
+  "The whole workspace subtree."
+  source(ws: Workspace!): Directory!
+  "Container with the whole workspace mounted, workdir at the root."
+  container(ws: Workspace!): Container!
+
+  # ---- checks: one `deno` exec at the root; the toolchain fans out ----
+  "Lint every member (`deno lint`)."
+  lint(ws: Workspace!): Void @check
+  "Test every member (`deno test`)."
+  test(ws: Workspace!, permissions: [String!]! = [], allowAll: Boolean! = false): Void @check
+  "Type-check every member (`deno check`)."
+  typeCheck(ws: Workspace!): Void @check
+  "Check formatting of every member (`deno fmt --check`)."
+  formatCheck(ws: Workspace!): Void @check
+
+  # ---- generator ----
+  "Format the whole workspace (`deno fmt`); one changeset over every member."
+  format(ws: Workspace!): Changeset! @generate
 }
 ```
 
@@ -433,20 +553,28 @@ the caller's location can't represent changes *above* it (a `..` path collapses)
 So `projects`/`workspaces` list ancestors for context, but `lintAll` … `formatAll`
 filter to `inCone(dir) = !dir.hasPrefix("..")`.
 
-**`container` — cache deps independently of source (manifests first):**
+**`container` — mount the *workspace root*, set workdir to the member (v0.2):**
 
 ```dang
+# deno-project.dang — `workspaceRoot` == `path` for a standalone project
 pub container(ws: Workspace!): Container! {
-  # dependency layer: mount only the manifests, warm DENO_DIR — caches on their
-  # content, independent of source edits
-  let deps = base
-    .withWorkdir("/src")
-    .withDirectory("/src", ws.directory(path, include: ["deno.json", "deno.jsonc", "deno.lock"]))
-    .withExec(["deno", "install"])
-  # source on top
-  deps.withDirectory("/src", source(ws))
+  let rel = if (path == workspaceRoot) { "" } else { path.trimPrefix(workspaceRoot + "/") }
+  let workdir = if (rel == "") { "/src" } else { "/src/" + rel }
+  base
+    .withEnvVariable("DENO_DIR", "/deno-dir")
+    .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
+    .withDirectory("/src", ws.directory(workspaceRoot, exclude: [".git", "**/node_modules"]))
+    .withWorkdir(workdir)
 }
 ```
+
+This is the single most important workspace change (mirrors `dagger/go`): a
+member must see the workspace root's `deno.lock` + import map and its sibling
+members, so the whole root is mounted and only the workdir moves. Every verb runs
+its `deno` command in `workdir` — which scopes to the member while still walking
+up to the root. Deps are warmed lazily by `deno` on first exec into `DENO_DIR`
+(mounted as a cache volume), so no separate manifest-only install layer is
+needed.
 
 **`format` — run `deno fmt`, diff, return a Changeset:**
 
@@ -459,9 +587,11 @@ pub format(ws: Workspace!): Changeset! @generate {
 ```
 
 For v0.1 (single project at `.`) the changeset paths are already
-workspace-relative. Multi-project generate must re-root each project's changes
-at its `path` before merging (the `dagger/go` `generateAll` pattern) — a phase-2
-concern.
+workspace-relative. `formatAll` re-roots each project/workspace's changes at its
+`path` before merging (the `dagger/go` `generateAll` pattern): build a `before`
+directory from each `source(ws)` at its `path`, a matching `after` from each
+formatted subtree, then `after.changes(before)` — one workspace-relative
+`Changeset`.
 
 **`test` — permissions sourced from `deno.json` via `-P` (no args), with an `-A`
 fallback for pre-2.5.0 toolchains:**
@@ -483,16 +613,34 @@ pub test(ws: Workspace!): Void @check {
 so it is passed unconditionally.
 
 **File layout (multi-file module):** split by type — `deno.dang` (root `Deno`),
-`deno-project.dang` (`DenoProject`), and future types each in their own file. All
-`.dang` files in the directory share one scope, so types cross-reference with no
-imports. (See §10 "To verify" on installed multi-file modules with `Workspace`
-args.)
+`deno-project.dang` (`DenoProject`), `deno-workspace.dang` (`DenoWorkspace`), and
+the internal `DenoConfig` record. All `.dang` files in the directory share one
+scope, so types cross-reference with no imports.
 
-**Discovering `workspace` members (phase 2):** a root `deno.json` `workspace`
-array lists member paths. Read it by globbing `**/deno.json` (each is a project),
-or, if we need the array itself, with a tiny native helper that parses the JSON
-(the `dagger/go` helper pattern). Deno needs far less native help than Go — no
-import graph to resolve.
+**Discovering `workspace` roots (v0.2, no native binary):** a root `deno.json`
+`workspace` array marks it as a workspace root. Rather than the anticipated native
+Go helper, Dang's type-driven `JSON.decode` reads it in-language:
+
+```dang
+type DenoConfig { pub workspace: [String!]! = [] }   # partial view of deno.json
+
+let isWorkspaceRoot(ws: Workspace!, dir: String!): Boolean! {
+  let text = configText(ws, dir)   # deno.json(c) contents, "" if absent
+  try {
+    let cfg: DenoConfig! = JSON.decode(text)
+    cfg.workspace.length > 0
+  } catch {
+    err => text.contains("\"workspace\"")   # deno.jsonc-with-comments fallback
+  }
+}
+```
+
+A project's workspace root is the nearest ancestor-or-self that is a workspace
+root (`findWorkspaceRoot`, a small recursive walk up `parentDir`). Members
+themselves are enumerated by globbing `**/deno.json(c)` under the root — the
+workspace-wide checks lean on `deno`'s own resolution, so they honor the exact
+`workspace` array (globs/excludes) regardless of how `members` globs. Deno needs
+far less native help than Go — no import graph, no helper binary.
 
 ---
 
@@ -557,10 +705,27 @@ supplying the `@up` service the base module intentionally leaves to them.
       args); default `version` bumped to `2.9.3`, with an `-A` fallback below 2.5.0
 - [ ] ~~`audit`~~ — deferred (out of scope); no longer version-blocked
 
-**v0.2 / later**
+**v0.2 — shipped (Deno workspaces)**
 
-- [ ] `deno.json` `workspace`-array-aware grouping (native helper); today each
-      deno.json is discovered independently by glob
+- [x] `deno.json` `workspace`-array awareness — `JSON.decode` in-language (no native
+      binary); each root/member/standalone discovered and partitioned
+- [x] `DenoWorkspace` type (`deno-workspace.dang`): `members`, `container`, and
+      root-level `lint`/`test`/`typeCheck`/`formatCheck` (@check) + `format`
+      (@generate) that let `deno` fan out over members
+- [x] discovery: `workspaces(ws)` + `workspace(ws, path, findUp)`; `projects(ws)`
+      now standalone-only; `project(ws, path)` resolves `workspaceRoot`
+- [x] **member container fix**: mount the workspace root, workdir = member (shared
+      lockfile / import map / cross-member imports resolve)
+- [x] `*All` iterates workspaces (fan-out) + standalone projects (no double-run)
+- [x] e2e: real workspace fixture (root + 2 members, cross-member import) +
+      `workspace-check` / `workspace-member-check`
+
+**later**
+
+- [ ] honor `workspace`-array globs/excludes in `members(ws)` (today it globs
+      subdir configs; the *checks* already honor them via `deno`'s own resolution)
+- [ ] robust `deno.jsonc` (comment/trailing-comma) root parsing beyond the
+      substring fallback (normalize through the Deno toolchain if a real need appears)
 - [ ] `coverage` / `bench` once Dagger has the DX to surface reports
 - [ ] `audit` — wire `deno audit` (now available in the pinned version)
 - [ ] `publish` (JSR, secret auth); Deno Deploy
@@ -601,5 +766,18 @@ supplying the `@up` service the base module intentionally leaves to them.
   mount was moved into `container(ws)` so a custom `base` still gets caching.)
 - **Source over-mounting**: `source = ws.directory(path)` includes the whole
   subtree (good for runtime-read assets/testdata) — confirm we don't need
-  targeted excludes for large data dirs.
+  targeted excludes for large data dirs. For a workspace member, `container(ws)`
+  now mounts the *entire workspace root* (necessary for shared config/lock) — a
+  larger cache key than a standalone project, but correctness requires it.
+- ~~**Reading `deno.json`'s `workspace` array**~~ — **resolved**: `JSON.decode` +
+  `File.contents` in pure Dang (verified on beta.6); no native binary. `JSON.decode`
+  is strict JSON, so `deno.jsonc` roots with comments fall back to a `"workspace"`
+  substring check. (Use the `JSON` namespace, never bare `fromJSON`/`toJSON`.)
+- **Cross-module module-object lists (engine limitation, beta.6)**: a list of a
+  *dependency's* object type (`deno().workspaces(ws)`/`members(ws)` called from
+  the e2e module) is a lazy `GraphQL[T!]` — `map`/`filter`/`length`/indexing all
+  error until materialized, and `.{field}` materialization of dependency
+  module-object lists is unreliable. Same-module list ops (inside `deno.dang`)
+  work fine. E2e asserts workspace behavior via scalars (`.path`,
+  `.workspaceRoot`) + `@check` runs instead; revisit if a later engine lifts this.
 </content>

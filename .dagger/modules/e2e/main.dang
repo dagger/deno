@@ -11,6 +11,7 @@ type E2e {
   let withDepsPath: String! = modulesRoot + "/with-deps"
   let permNetPath: String! = modulesRoot + "/perm-net"
   let permAppPath: String! = modulesRoot + "/perm-app"
+  let workspacePath: String! = modulesRoot + "/workspace"
 
   """
   Fail the current check when a condition is false.
@@ -31,7 +32,9 @@ type E2e {
 
   """
   Discovery + workspace-wide verbs: formatCheckAll fails because the discovered
-  fmt-dirty fixture is unformatted, and formatAll's changeset includes it.
+  fmt-dirty fixture is unformatted, formatAll's changeset includes it, and
+  discovery partitions the workspace fixture (a root + members) apart from the
+  standalone projects.
   """
   pub discoveryCheck(ws: Workspace!): Void @check {
     let formatFailed = try {
@@ -46,6 +49,107 @@ type E2e {
     assert(
       contains(changes.modifiedPaths, fmtDirtyPath + "/main.ts"),
       "formatAll changeset did not include the discovered fmt-dirty project",
+    )
+
+    # A standalone project (no workspace ancestor) resolves its workspace root to
+    # itself, so it mounts only its own subtree.
+    assert(
+      deno().project(ws, helloPath).workspaceRoot == helloPath,
+      "standalone project should resolve its workspace root to itself",
+    )
+    null
+  }
+
+  """
+  A real Deno workspace: its root deno.json `workspace` array is discovered, the
+  workspace-wide checks fan out across every member, and members are enumerated.
+  """
+  pub workspaceCheck(ws: Workspace!): Void @check {
+    let workspace = deno().workspace(ws, workspacePath)
+    assert(workspace.path == workspacePath, "workspace lookup returned wrong path: " + workspace.path)
+
+    workspace.lint(ws)
+    workspace.typeCheck(ws)
+    workspace.formatCheck(ws)
+    workspace.test(ws)
+
+    null
+  }
+
+  """
+  A workspace member resolves its workspace root, so a single-member typeCheck /
+  test sees the shared config and the sibling `@ws/util` package. Mounting only
+  the member subtree (the pre-workspace behavior) would fail this check.
+  """
+  pub workspaceMemberCheck(ws: Workspace!): Void @check {
+    let add = deno().project(ws, workspacePath + "/add")
+    assert(add.path == workspacePath + "/add", "member path wrong: " + add.path)
+    assert(
+      add.workspaceRoot == workspacePath,
+      "member did not resolve its workspace root: " + add.workspaceRoot,
+    )
+    # The sibling `util` package is also a member of the same workspace root.
+    let util = deno().project(ws, workspacePath + "/util")
+    assert(
+      util.workspaceRoot == workspacePath,
+      "sibling member did not resolve its workspace root: " + util.workspaceRoot,
+    )
+
+    # These only pass because `add`'s container mounts the workspace root, so the
+    # cross-member `@ws/util` import and shared config resolve.
+    add.typeCheck(ws)
+    add.test(ws)
+    null
+  }
+
+  """
+  A workspace with a cross-member import, rooted directly at the discovery cwd so
+  the fan-out `*All` verbs run over just this workspace. It guards the partition:
+  the root is fanned out via `deno`'s own workspace resolution while its members
+  are excluded from the standalone `projects` list. If a member leaked into
+  `projects` it would be type-checked as a standalone project (mounting only its
+  own subtree) and the cross-member `@ws/util` import would fail. Passing all three
+  verbs proves both the fan-out and the partition hold.
+  """
+  pub workspaceAllCheck(): Void @check {
+    let sub = directory
+      .withNewFile("deno.json", "{\n  \"workspace\": [\"./add\", \"./util\"]\n}\n")
+      .withNewFile("util/deno.json", "{\n  \"name\": \"@ws/util\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile("util/mod.ts", "export function tag(): string {\n  return \"util\";\n}\n")
+      .withNewFile("add/deno.json", "{\n  \"name\": \"@ws/add\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile(
+        "add/mod.ts",
+        "import { tag } from \"@ws/util\";\n\nexport function describe(n: number): string {\n  return `${tag()}:${n}`;\n}\n",
+      )
+      .withNewFile(
+        "add/mod_test.ts",
+        "import { describe } from \"./mod.ts\";\n\nDeno.test(\"describe uses the cross-member util package\", () => {\n  if (describe(3) !== \"util:3\") {\n    throw new Error(\"unexpected describe output\");\n  }\n});\n",
+      )
+      .asWorkspace()
+    deno().typeCheckAll(sub)
+    deno().testAll(sub)
+    deno().lintAll(sub)
+    null
+  }
+
+  """
+  A workspace `format` produces one changeset spanning its members: `deno fmt` at
+  the root reformats a badly formatted member and the changeset reports that
+  member's file. Uses a throwaway workspace so the clean on-disk fixture stays
+  clean for the other checks.
+  """
+  pub workspaceFormatCheck(): Void @check {
+    let dirty = directory
+      .withNewFile("deno.json", "{\n  \"workspace\": [\"./pkg\"]\n}\n")
+      .withNewFile("pkg/deno.json", "{\n  \"name\": \"@ws/pkg\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile("pkg/mod.ts", "export function f(a:number){return a}\n")
+    let wsDir = dirty.asWorkspace()
+    let changes = deno().workspace(wsDir, ".").format(wsDir)
+
+    assert(changes.isEmpty == false, "workspace format produced no diff on a badly formatted member")
+    assert(
+      contains(changes.modifiedPaths, "pkg/mod.ts"),
+      "workspace format changeset did not touch the dirty member",
     )
     null
   }

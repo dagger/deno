@@ -42,30 +42,153 @@ type Deno {
   The Deno project containing `path`. With findUp (default) `path` may be any
   directory inside a project and snaps to its root (the nearest deno.json /
   deno.jsonc); set findUp: false when `path` is already a project root.
+
+  If the project is a member of a Deno workspace, its workspace root is resolved
+  so commands run with the shared deno.lock, import map, and sibling members.
   """
   pub project(ws: Workspace!, path: String!, findUp: Boolean! = true): DenoProject! {
-    let root = if (findUp) {
+    let projectPath = if (findUp) {
       findProjectRoot(ws, path)
     } else {
       path
     }
-    DenoProject(path: root, base: base, version: version)
+    DenoProject(
+      path: projectPath,
+      workspaceRoot: findWorkspaceRoot(ws, projectPath) ?? projectPath,
+      base: base,
+      version: version,
+    )
   }
 
   """
-  Every Deno project discovered from the caller's location: the projects at and
-  under the current workspace location (`.`), plus the ancestor projects walking up
-  to the workspace root. Paths are relative to the current location (`.`, `sub`,
-  `..`, `../..`, …). node_modules is excluded.
+  The Deno workspace containing `path` (a directory whose deno.json declares a
+  `workspace` array). With findUp (default) `path` may be any directory inside
+  the workspace and snaps up to the root; set findUp: false when `path` is
+  already the workspace root.
+  """
+  pub workspace(ws: Workspace!, path: String!, findUp: Boolean! = true): DenoWorkspace! {
+    let root = if (findUp) {
+      let found = findWorkspaceRoot(ws, normalizePath(path))
+      if (found == null) {
+        raise "no Deno workspace (deno.json with a `workspace` array) found containing path: " + path
+      } else {
+        found
+      }
+    } else {
+      path
+    }
+    DenoWorkspace(path: root, base: base, version: version)
+  }
+
+  """
+  Every Deno workspace discovered: each directory whose deno.json / deno.jsonc
+  declares a `workspace` array (excluding node_modules).
+  """
+  pub workspaces(ws: Workspace!): [DenoWorkspace!]! {
+    configDirs(ws)
+      .filter { dir => isWorkspaceRoot(ws, dir) }
+      .map { dir => DenoWorkspace(path: dir, base: base, version: version) }
+  }
+
+  """
+  Every standalone Deno project discovered: each directory with a deno.json /
+  deno.jsonc that is neither a workspace root nor a member of one (those are
+  reached through `workspaces` / a workspace's `members`). node_modules is
+  excluded.
   """
   pub projects(ws: Workspace!): [DenoProject!]! {
-    configDirs(ws).map { dir => DenoProject(path: dir, base: base, version: version) }
+    let dirs = configDirs(ws)
+    let roots = dirs.filter { dir => isWorkspaceRoot(ws, dir) }
+    dirs
+      .filter { dir => roots.contains(dir) == false }
+      .filter { dir => roots.any { root => underRoot(dir, root) } == false }
+      .map { dir => DenoProject(path: dir, workspaceRoot: dir, base: base, version: version) }
   }
 
   """
-  Every directory holding a deno.json / deno.jsonc visible from the caller's
-  location: at and under the current location (`.`), plus ancestors walking up to
-  the workspace root. Paths are relative to the current location.
+  Whether a discovered directory is in the caller's cone (its own project plus
+  descendants), as opposed to an ancestor reached by walking up ("..", "../..").
+  The workspace-wide verbs run on the cone only; ancestors are listed by
+  `projects` / `workspaces` but never checked or formatted from here.
+  """
+  let inCone(dir: String!): Boolean! {
+    dir.hasPrefix("..") == false
+  }
+
+  """
+  The discovered workspaces in the caller's cone (excluding ancestors).
+  """
+  let coneWorkspaces(ws: Workspace!): [DenoWorkspace!]! {
+    workspaces(ws).filter { w => inCone(w.path) }
+  }
+
+  """
+  The discovered standalone projects in the caller's cone (excluding ancestors).
+  """
+  let coneProjects(ws: Workspace!): [DenoProject!]! {
+    projects(ws).filter { p => inCone(p.path) }
+  }
+
+  """
+  Lint every workspace and standalone project in the caller's cone (`deno lint`).
+  """
+  pub lintAll(ws: Workspace!): Void @check {
+    coneWorkspaces(ws).each { w => w.lint(ws) }
+    coneProjects(ws).each { p => p.lint(ws) }
+    null
+  }
+
+  """
+  Test every workspace and standalone project in the caller's cone (`deno test`).
+  """
+  pub testAll(ws: Workspace!): Void @check {
+    coneWorkspaces(ws).each { w => w.test(ws) }
+    coneProjects(ws).each { p => p.test(ws) }
+    null
+  }
+
+  """
+  Type-check every workspace and standalone project in the caller's cone
+  (`deno check`).
+  """
+  pub typeCheckAll(ws: Workspace!): Void @check {
+    coneWorkspaces(ws).each { w => w.typeCheck(ws) }
+    coneProjects(ws).each { p => p.typeCheck(ws) }
+    null
+  }
+
+  """
+  Check formatting of every workspace and standalone project in the caller's cone
+  (`deno fmt --check`).
+  """
+  pub formatCheckAll(ws: Workspace!): Void @check {
+    coneWorkspaces(ws).each { w => w.formatCheck(ws) }
+    coneProjects(ws).each { p => p.formatCheck(ws) }
+    null
+  }
+
+  """
+  Format every workspace and standalone project in the caller's cone (`deno fmt`);
+  returns one changeset. Ancestor projects are excluded — a changeset rooted at
+  the caller's location can't represent changes above it.
+  """
+  pub formatAll(ws: Workspace!): Changeset! @generate {
+    let wsRoots = coneWorkspaces(ws)
+    let projs = coneProjects(ws)
+    let before = projs.reduce(
+      wsRoots.reduce(directory) { acc, w => acc.withDirectory(w.path, w.source(ws)) }
+    ) { acc, p => acc.withDirectory(p.path, p.source(ws)) }
+    let afterWorkspaces = wsRoots.reduce(before) { acc, w =>
+      acc.withDirectory(w.path, w.container(ws).withExec(["deno", "fmt"]).directory("."))
+    }
+    let after = projs.reduce(afterWorkspaces) { acc, p =>
+      acc.withDirectory(p.path, p.container(ws).withExec(["deno", "fmt"]).directory("."))
+    }
+    after.changes(before)
+  }
+
+  """
+  Every directory in the workspace that holds a deno.json / deno.jsonc.
   """
   let configDirs(ws: Workspace!): [String!]! {
     let src = ws.directory(
@@ -109,7 +232,7 @@ type Deno {
   }
 
   """
-  Project root directory for a discovered deno.json/deno.jsonc path.
+  Directory holding a discovered deno.json / deno.jsonc (workspace-relative).
   """
   let configDir(cfgPath: String!): String! {
     let dir = cfgPath.trimSuffix("/deno.jsonc").trimSuffix("/deno.json")
@@ -117,68 +240,78 @@ type Deno {
   }
 
   """
-  Whether a discovered directory is in the caller's cone (its own project plus
-  descendants), as opposed to an ancestor reached by walking up ("..", "../..").
-  The workspace-wide verbs run on the cone only; ancestors are listed by `projects`
-  but never checked or formatted from here.
+  Contents of the deno.json / deno.jsonc at `dir`, or "" when neither exists.
   """
-  let inCone(dir: String!): Boolean! {
-    dir.hasPrefix("..") == false
-  }
-
-  """
-  The discovered projects in the caller's cone (excluding ancestors).
-  """
-  let coneProjects(ws: Workspace!): [DenoProject!]! {
-    projects(ws).filter { p => inCone(p.path) }
-  }
-
-  """
-  Lint every project in the caller's cone (`deno lint`).
-  """
-  pub lintAll(ws: Workspace!): Void @check {
-    coneProjects(ws).each { p => p.lint(ws) }
-    null
-  }
-
-  """
-  Test every project in the caller's cone (`deno test`).
-  """
-  pub testAll(ws: Workspace!): Void @check {
-    coneProjects(ws).each { p => p.test(ws) }
-    null
-  }
-
-  """
-  Type-check every project in the caller's cone (`deno check`).
-  """
-  pub typeCheckAll(ws: Workspace!): Void @check {
-    coneProjects(ws).each { p => p.typeCheck(ws) }
-    null
-  }
-
-  """
-  Check formatting of every project in the caller's cone (`deno fmt --check`).
-  """
-  pub formatCheckAll(ws: Workspace!): Void @check {
-    coneProjects(ws).each { p => p.formatCheck(ws) }
-    null
-  }
-
-  """
-  Format every project in the caller's cone (`deno fmt`); returns one changeset.
-  Ancestor projects are excluded — a changeset rooted at the caller's location
-  can't represent changes above it.
-  """
-  pub formatAll(ws: Workspace!): Changeset! @generate {
-    let mods = coneProjects(ws)
-    let before = mods.reduce(directory) { acc, p =>
-      acc.withDirectory(p.path, p.source(ws))
+  let configText(ws: Workspace!, dir: String!): String! {
+    let d = ws.directory(dir)
+    if (d.glob("deno.jsonc").length > 0) {
+      d.file("deno.jsonc").contents
+    } else if (d.glob("deno.json").length > 0) {
+      d.file("deno.json").contents
+    } else {
+      ""
     }
-    let after = mods.reduce(before) { acc, p =>
-      acc.withDirectory(p.path, p.container(ws).withExec(["deno", "fmt"]).directory("."))
+  }
+
+  """
+  Whether the deno.json / deno.jsonc at `dir` declares a non-empty `workspace`
+  array (i.e. `dir` is a Deno workspace root).
+  """
+  let isWorkspaceRoot(ws: Workspace!, dir: String!): Boolean! {
+    let text = configText(ws, dir)
+    if (text == "") {
+      false
+    } else {
+      try {
+        let cfg: DenoConfig! = JSON.decode(text)
+        cfg.workspace.length > 0
+      } catch {
+        # deno.jsonc with comments/trailing commas isn't strict JSON; fall back
+        # to a presence check on the `workspace` key.
+        err => text.contains("\"workspace\"")
+      }
     }
-    after.changes(before)
+  }
+
+  """
+  Whether `dir` sits inside the workspace rooted at `root`.
+  """
+  let underRoot(dir: String!, root: String!): Boolean! {
+    if (root == ".") {
+      dir != "."
+    } else {
+      dir == root or dir.hasPrefix(root + "/")
+    }
+  }
+
+  """
+  Normalize a workspace-relative path: strip leading/trailing slashes, "" -> ".".
+  """
+  let normalizePath(path: String!): String! {
+    let p = path.trimPrefix("/").trimSuffix("/")
+    if (p == "") { "." } else { p }
+  }
+
+  """
+  Parent directory of a workspace-relative path (".", for a top-level dir).
+  """
+  let parentDir(dir: String!): String! {
+    let parts = dir.split("/")
+    if (parts.length <= 1) { "." } else { parts.dropLast(1).join("/") }
+  }
+
+  """
+  Nearest ancestor-or-self of `dir` that is a Deno workspace root, or null when
+  `dir` belongs to no workspace.
+  """
+  let findWorkspaceRoot(ws: Workspace!, dir: String!): String {
+    if (isWorkspaceRoot(ws, dir)) {
+      dir
+    } else if (dir == ".") {
+      null
+    } else {
+      findWorkspaceRoot(ws, parentDir(dir))
+    }
   }
 
   """
@@ -198,4 +331,12 @@ type Deno {
       }
     }
   }
+}
+
+"""
+Partial view of a deno.json / deno.jsonc used for workspace discovery: only the
+`workspace` array (the list of monorepo member paths) is decoded.
+"""
+type DenoConfig {
+  pub workspace: [String!]! = []
 }
