@@ -9,6 +9,15 @@ type DenoProject {
   pub path: String!
 
   """
+  Workspace-relative path of the Deno workspace root this project belongs to.
+  Equals `path` for a standalone project; for a member of a Deno workspace it is
+  the directory holding the root deno.json (whose `workspace` array lists this
+  member). Commands run from the workspace root so the shared deno.lock, import
+  map, and sibling members resolve.
+  """
+  pub workspaceRoot: String!
+
+  """
   Base container carrying the Deno toolchain, inherited from the Deno root.
   """
   let base: Container!
@@ -38,16 +47,22 @@ type DenoProject {
   }
 
   """
-  Container with the Deno toolchain and this project's source mounted at the
-  workdir. The base every verb builds on, and the extension point for
-  downstream modules.
+  Container with the Deno toolchain and the project mounted at the workdir. The
+  base every verb builds on, and the extension point for downstream modules.
+
+  For a standalone project the project subtree is mounted. For a workspace member
+  the whole workspace root is mounted and the workdir is set to the member's
+  subdirectory, so `deno` can walk up to the shared deno.lock, import map, and
+  sibling members while still scoping each command to this member.
   """
   pub container(ws: Workspace!): Container! {
+    let rel = if (path == workspaceRoot) { "" } else { path.trimPrefix(workspaceRoot + "/") }
+    let workdir = if (rel == "") { "/src" } else { "/src/" + rel }
     base
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
-      .withWorkdir("/src")
-      .withDirectory("/src", source(ws))
+      .withDirectory("/src", ws.directory(workspaceRoot, exclude: [".git", "**/node_modules"]))
+      .withWorkdir(workdir)
   }
 
   """

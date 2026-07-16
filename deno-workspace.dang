@@ -1,0 +1,164 @@
+"""
+A Deno workspace (monorepo): a directory whose deno.json / deno.jsonc declares a
+`workspace` array of members. The whole tree shares a single deno.lock and import
+map, and `deno` fans a single command out across every member — so the
+workspace-wide checks here run one command at the root instead of iterating
+members by hand.
+"""
+type DenoWorkspace {
+  """
+  Workspace-relative path of the workspace root (the directory holding the root
+  deno.json / deno.jsonc with the `workspace` array).
+  """
+  pub path: String!
+
+  """
+  Base container carrying the Deno toolchain, inherited from the Deno root.
+  """
+  let base: Container!
+
+  """
+  Deno version configured on the root, used to gate version-specific flags.
+  """
+  let version: String!
+
+  """
+  The workspace's root deno.json / deno.jsonc file.
+  """
+  pub config(ws: Workspace!): File! {
+    let dir = ws.directory(path)
+    if (dir.glob("deno.jsonc").length > 0) {
+      dir.file("deno.jsonc")
+    } else {
+      dir.file("deno.json")
+    }
+  }
+
+  """
+  The workspace's source directory (its whole subtree of the outer workspace).
+  """
+  pub source(ws: Workspace!): Directory! {
+    ws.directory(path, exclude: [".git", "**/node_modules"])
+  }
+
+  """
+  Container with the Deno toolchain and the whole workspace mounted at the
+  workdir. Workspace-wide commands run here so `deno` fans out across every
+  member with the shared deno.lock and import map.
+  """
+  pub container(ws: Workspace!): Container! {
+    base
+      .withEnvVariable("DENO_DIR", "/deno-dir")
+      .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
+      .withDirectory("/src", source(ws))
+      .withWorkdir("/src")
+  }
+
+  """
+  Member directory (relative to the workspace root) for a discovered config path.
+  """
+  let memberDir(cfgPath: String!): String! {
+    let dir = cfgPath.trimSuffix("/deno.jsonc").trimSuffix("/deno.json")
+    if (dir == cfgPath) { "." } else { dir }
+  }
+
+  """
+  The member projects discovered under this workspace: every directory below the
+  root that has its own deno.json / deno.jsonc. Each is a DenoProject that mounts
+  the workspace root, so single-member commands still resolve the shared lockfile
+  and sibling members. (The workspace-wide checks below use `deno`'s own
+  workspace resolution, so they honor the exact `workspace` array regardless.)
+  """
+  pub members(ws: Workspace!): [DenoProject!]! {
+    let src = ws.directory(
+      path,
+      include: ["**/deno.json", "**/deno.jsonc"],
+      exclude: ["**/node_modules/**"],
+    )
+    (src.glob("**/deno.json") + src.glob("**/deno.jsonc"))
+      .map { cfg => memberDir(cfg) }
+      .filter { dir => dir != "." }
+      .uniq
+      .map { dir =>
+        DenoProject(
+          path: if (path == ".") { dir } else { path + "/" + dir },
+          workspaceRoot: path,
+          base: base,
+          version: version,
+        )
+      }
+  }
+
+  """
+  Numeric >= for two non-negative integer strings without leading zeros: the
+  longer one is larger, and equal lengths compare lexically.
+  """
+  let numGte(a: String!, b: String!): Boolean! {
+    let da = a.split("").length
+    let db = b.split("").length
+    if (da != db) { da > db } else { a >= b }
+  }
+
+  """
+  Whether the configured Deno version supports config-file permission sets and
+  the `-P` flag (added in Deno 2.5.0). Compares the version's major.minor.
+  """
+  let supportsPermissionSets(): Boolean! {
+    let parts = version.split(".")
+    let major = parts[0] ?? "0"
+    let minor = if (parts.length > 1) { parts[1] ?? "0" } else { "0" }
+    if (numGte(major, "3")) {
+      true
+    } else if (major == "2") {
+      numGte(minor, "5")
+    } else {
+      false
+    }
+  }
+
+  """
+  Lint every member of the workspace (`deno lint`).
+  """
+  pub lint(ws: Workspace!): Void @check {
+    container(ws).withExec(["deno", "lint"]).sync
+    null
+  }
+
+  """
+  Test every member of the workspace (`deno test`). Permissions come from each
+  member's deno.json (`test.permissions`) via `-P`, not from arguments; below
+  Deno 2.5.0 (no `-P`) it falls back to `-A`.
+  """
+  pub test(ws: Workspace!): Void @check {
+    let permissionFlag = if (supportsPermissionSets()) { "-P" } else { "-A" }
+    container(ws).withExec(["deno", "test", "--permit-no-files", permissionFlag]).sync
+    null
+  }
+
+  """
+  Type-check every member of the workspace (`deno check`).
+  """
+  pub typeCheck(ws: Workspace!): Void @check {
+    container(ws).withExec(["deno", "check", "."]).sync
+    null
+  }
+
+  """
+  Check formatting of every member without writing (`deno fmt --check`).
+  """
+  pub formatCheck(ws: Workspace!): Void @check {
+    container(ws).withExec(["deno", "fmt", "--check"]).sync
+    null
+  }
+
+  """
+  Format the whole workspace (`deno fmt`); returns one changeset covering every
+  member, for review before writing.
+  """
+  pub format(ws: Workspace!): Changeset! @generate {
+    let before = directory.withDirectory(path, source(ws))
+    let formatted = container(ws).withExec(["deno", "fmt"]).directory(".")
+    let after = directory.withDirectory(path, formatted)
+    after.changes(before)
+  }
+}
