@@ -1,0 +1,155 @@
+"""
+A Deno project rooted at a workspace-relative path (a directory containing a
+deno.json / deno.jsonc).
+"""
+type DenoProject {
+  """
+  Workspace-relative path of this project root.
+  """
+  pub path: String!
+
+  """
+  Base container carrying the Deno toolchain, inherited from the Deno root.
+  """
+  let base: Container!
+
+  """
+  Deno version configured on the root, used to gate version-specific flags.
+  """
+  let version: String!
+
+  """
+  This project's deno.json / deno.jsonc file.
+  """
+  pub config(ws: Workspace!): File! {
+    let dir = ws.directory(path)
+    if (dir.glob("deno.jsonc").length > 0) {
+      dir.file("deno.jsonc")
+    } else {
+      dir.file("deno.json")
+    }
+  }
+
+  """
+  This project's source directory (its subtree of the workspace).
+  """
+  pub source(ws: Workspace!): Directory! {
+    ws.directory(path, exclude: [".git", "**/node_modules"])
+  }
+
+  """
+  Container with the Deno toolchain and this project's source mounted at the
+  workdir. The base every verb builds on, and the extension point for
+  downstream modules.
+  """
+  pub container(ws: Workspace!): Container! {
+    base
+      .withEnvVariable("DENO_DIR", "/deno-dir")
+      .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
+      .withWorkdir("/src")
+      .withDirectory("/src", source(ws))
+  }
+
+  """
+  Lint this project (`deno lint`).
+  """
+  pub lint(ws: Workspace!): Void @check {
+    container(ws).withExec(["deno", "lint"]).sync
+    null
+  }
+
+  """
+  Numeric >= for two non-negative integer strings without leading zeros: the
+  longer one is larger, and equal lengths compare lexically (which matches
+  numeric order for same-width digits).
+  """
+  let numGte(a: String!, b: String!): Boolean! {
+    let da = a.split("").length
+    let db = b.split("").length
+    if (da != db) { da > db } else { a >= b }
+  }
+
+  """
+  Whether the configured Deno version supports config-file permission sets and
+  the `-P` flag (added in Deno 2.5.0). Compares the version's major.minor via
+  numGte (no numeric parsing needed).
+  """
+  let supportsPermissionSets(): Boolean! {
+    let parts = version.split(".")
+    let major = parts[0] ?? "0"
+    let minor = if (parts.length > 1) { parts[1] ?? "0" } else { "0" }
+    # >= 2.5.0: major >= 3, or major == 2 and minor >= 5.
+    if (numGte(major, "3")) {
+      true
+    } else if (major == "2") {
+      numGte(minor, "5")
+    } else {
+      false
+    }
+  }
+
+  """
+  Run this project's tests (`deno test`). On Deno >= 2.5.0 permissions are
+  governed entirely by the project's deno.json (`test.permissions`, or a
+  top-level set), activated with `-P` — there is no Dagger-side permission
+  argument. On older versions `-P` does not exist, so `test` falls back to `-A`
+  (grant all) instead of sending an unsupported flag.
+  """
+  pub test(ws: Workspace!): Void @check {
+    # --permit-no-files: a project with no test files is a pass, not an error.
+    # -P applies deno.json's permission config (>= 2.5.0); older Deno gets -A.
+    let permissionFlag = if (supportsPermissionSets()) { "-P" } else { "-A" }
+    container(ws).withExec(["deno", "test", "--permit-no-files", permissionFlag]).sync
+    null
+  }
+
+  """
+  Type-check the project without running it (`deno check`).
+  """
+  pub typeCheck(ws: Workspace!): Void @check {
+    container(ws).withExec(["deno", "check", "."]).sync
+    null
+  }
+
+  """
+  Check formatting without writing (`deno fmt --check`).
+  """
+  pub formatCheck(ws: Workspace!): Void @check {
+    container(ws).withExec(["deno", "fmt", "--check"]).sync
+    null
+  }
+
+  """
+  Format the project (`deno fmt`); returns the diff for review before writing.
+  """
+  pub format(ws: Workspace!): Changeset! @generate {
+    let before = directory.withDirectory(path, source(ws))
+    let formatted = container(ws).withExec(["deno", "fmt"]).directory(".")
+    let after = directory.withDirectory(path, formatted)
+    after.changes(before)
+  }
+
+  """
+  Compile a standalone executable (`deno compile`). `target` cross-compiles
+  (e.g. "x86_64-unknown-linux-gnu"); null uses the base image's platform.
+
+  The binary's baked-in permissions come from the project's deno.json default
+  permission set (top-level `permissions.default`) via `-P`, mirroring `test` —
+  there is no Dagger-side permission argument. On Deno older than 2.5.0 (no `-P`)
+  the binary is built with no baked permissions, rather than forcing `-A` (grant
+  all) into a shipped artifact.
+  """
+  pub compile(
+    ws: Workspace!,
+    entrypoint: String! = "main.ts",
+    outputName: String! = "app",
+    target: String = null,
+  ): File! {
+    let targetFlag = if (target == null) { [] } else { ["--target", target] }
+    let permissionFlag = if (supportsPermissionSets()) { ["-P"] } else { [] }
+    let out = "/tmp/out/" + outputName
+    container(ws)
+      .withExec(["deno", "compile"] + permissionFlag + ["--output", out] + targetFlag + [entrypoint])
+      .file(out)
+  }
+}
