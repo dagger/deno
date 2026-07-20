@@ -107,9 +107,12 @@ type Deno {
 
   """
   Whether a discovered directory is in the caller's cone (its own project plus
-  descendants), as opposed to an ancestor reached by walking up ("..", "../..").
-  The workspace-wide verbs run on the cone only; ancestors are listed by
-  `projects` / `workspaces` but never checked or formatted from here.
+  descendants), as opposed to an ancestor found by walking up. `configDirs`
+  returns walk-down hits as CWD-relative paths (the cone: ".", "sub") and the
+  find-up hit as a ".."-relative path (an ancestor: "..", "../.."), so an ancestor
+  is exactly a ".."-prefixed path. The workspace-wide verbs run on the cone only;
+  ancestors are listed by `projects` / `workspaces` but never checked or formatted
+  from here.
   """
   let inCone(dir: String!): Boolean! {
     dir.hasPrefix("..") == false
@@ -188,55 +191,18 @@ type Deno {
   }
 
   """
-  Every directory in the workspace that holds a deno.json / deno.jsonc.
+  Every directory in the workspace that holds a deno.json / deno.jsonc, anchored
+  at the caller's location: its nearest enclosing project (find-up) plus every
+  project at or below it (walk-down), excluding node_modules. Delegates to the
+  reusable, cwd-aware `findConfigDirs` from the `polyfill` module
+  (github.com/dagger/dagger#13688), which returns walk-down hits as CWD-relative
+  paths (".", "sub") and the find-up hit as a ".."-relative path ("..", "../..").
   """
   let configDirs(ws: Workspace!): [String!]! {
-    let src = ws.directory(
-      ".",
-      include: ["**/deno.json", "**/deno.jsonc"],
+    polyfill().workspace(ws).findConfigDirs(
+      ["deno.json", "deno.jsonc"],
       exclude: ["**/node_modules/**"],
     )
-    let descendants = (src.glob("**/deno.json") + src.glob("**/deno.jsonc"))
-      .map { cfg => configDir(cfg) }
-    (descendants + ancestorConfigDirs(ws)).uniq
-  }
-
-  """
-  Ancestor directories of the current location that hold a deno.json / deno.jsonc,
-  walking up to the workspace root, expressed relative to the current location
-  ("..", "../..", …). This is how discovery from inside a subdirectory still sees
-  the projects it lives under.
-  """
-  let ancestorConfigDirs(ws: Workspace!): [String!]! {
-    let cwd = ws.cwd.trimPrefix("/").trimSuffix("/")
-    if (cwd == "") {
-      []
-    } else {
-      collectAncestors(ws, "..", cwd.split("/").length)
-    }
-  }
-
-  """
-  Walk `remaining` levels up from the current location (starting at `rel`),
-  collecting each ancestor directory that holds a deno.json / deno.jsonc.
-  """
-  let collectAncestors(ws: Workspace!, rel: String!, remaining: Int!): [String!]! {
-    if (remaining <= 0) {
-      []
-    } else {
-      let d = ws.directory(rel)
-      let hasConfig = d.glob("deno.json").length > 0 or d.glob("deno.jsonc").length > 0
-      let here = if (hasConfig) { [rel] } else { [] }
-      here + collectAncestors(ws, rel + "/..", remaining - 1)
-    }
-  }
-
-  """
-  Directory holding a discovered deno.json / deno.jsonc (workspace-relative).
-  """
-  let configDir(cfgPath: String!): String! {
-    let dir = cfgPath.trimSuffix("/deno.jsonc").trimSuffix("/deno.json")
-    if (dir == cfgPath) { "." } else { dir }
   }
 
   """

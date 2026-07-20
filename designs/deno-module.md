@@ -43,9 +43,12 @@ below, learned while building against a real engine:
   glibc-linked; for musl/alpine use the default `base`.
 - **`Workspace!` is auto-injected** as `currentWorkspace` (no `--ws` arg); the
   `ws`-passing model works transparently on the CLI and in `dagger check`.
-- **Discovery is relative to the caller's location** (shykes review): `projects(ws)`
-  globs `**/deno.json(c)` from `.` (self + descendants) **and** walks up to the
-  workspace root (ancestors as `..`-relative paths), excluding node_modules. See §7.
+- **Discovery is relative to the caller's location** (shykes review): the reusable
+  `findConfigDirs(filenames, exclude)` helper from the `polyfill` module (per
+  [dagger/dagger#13688](https://github.com/dagger/dagger/issues/13688)) globs
+  `**/deno.json(c)` from `.` (self + descendants) **and** find-ups the nearest
+  enclosing project (as a `..`-relative path), all CWD-relative, excluding
+  node_modules. See §7.
 - **Workspace-wide verbs shipped (v0.2 brought forward)** so the install DX works:
   `lintAll`/`testAll`/`typeCheckAll`/`formatCheckAll` (`@check`) and `formatAll`
   (`@generate`), run on the **caller's cone** (self + descendants, not ancestors).
@@ -206,7 +209,7 @@ commands out:
 Deno                       (toolchain config: version, base)
  ├─ version, base          constructor inputs (base derived from version)
  ├─ install(ctr)           install the Deno CLI + cache into any container
- ├─ workspaces(ws)         discover workspace roots (from cwd: self+descendants+ancestors) → [DenoWorkspace]
+ ├─ workspaces(ws)         discover workspace roots (from cwd: self+descendants+nearest ancestor) → [DenoWorkspace]
  ├─ workspace(ws, path)    resolve the workspace containing a path
  ├─ projects(ws)           discover STANDALONE deno.json(c) (from cwd, same reach) → [DenoProject]
  ├─ project(ws, path)      resolve the project containing a path (+ its workspace root)
@@ -340,7 +343,7 @@ type Deno {
   """
   Every Deno workspace discovered: each directory whose deno.json declares a
   `workspace` array of members. Discovered relative to the caller's location —
-  self + descendants + ancestors (see §7).
+  self + descendants + nearest enclosing ancestor (see §7).
   """
   workspaces(ws: Workspace!): [DenoWorkspace!]!
 
@@ -353,9 +356,10 @@ type Deno {
 
   """
   Every STANDALONE Deno project discovered relative to the caller's location (self
-  + descendants + ancestors, paths cwd-relative: `.`, `sub`, `..`): each deno.json(c)
-  that is neither a workspace root nor a member of one (those are reached through
-  `workspaces` and a workspace's `members`). node_modules is excluded.
+  + descendants `.`, `sub`; plus the nearest enclosing project as a `..`-relative
+  path), all CWD-relative: each deno.json(c) that is neither a workspace root nor a
+  member of one (those are reached through `workspaces` and a workspace's
+  `members`). node_modules is excluded.
   """
   projects(ws: Workspace!): [DenoProject!]!
 
@@ -537,21 +541,35 @@ Unlike Go, a Deno project's source *is* its directory: there's no in-tree
 no include-graph discovery is required.
 
 **Discovery is relative to the caller's location, not the workspace root.**
-`projects` globs `**/deno.json(c)` from `.` (the current workspace location, so
-paths come back relative to it) **and** walks up to the workspace root, adding
-each ancestor project as a `..`-relative path. Two facts drive this (both verified
-against the engine): `ws.directory(path)` resolves *relative* paths from the
-current location and *absolute* (`/…`) paths from the root; and `ws.cwd` gives the
-current location (`/`, `/sub`, …), whose depth bounds the up-walk. So from `/sub`
-with `/deno.json` + `/sub/deno.json`, `projects` returns `.` and `..`; from the
-root it returns `.` and `sub`.
+Discovery goes through one reusable, cwd-aware helper —
+`findConfigDirs(filenames, exclude)` — provided by the `polyfill` module
+(`polyfill().workspace(ws).findConfigDirs(...)`, see
+[dagger/dagger#13688](https://github.com/dagger/dagger/issues/13688)), so every
+module shares one implementation instead of reinventing it. `configDirs` is just
+`polyfill().workspace(ws).findConfigDirs(["deno.json", "deno.jsonc"], exclude: ["**/node_modules/**"])`.
+Anchored at the caller's location, it runs two walks, both returning CWD-relative
+paths:
+
+- **walk-down** globs `**/{filename}` from `.`, returning every match at or below
+  the current location (`.`, `sub`, …).
+- **find-up** uses the built-in `ws.findUp`, which stops at the workspace root, to
+  return the **nearest** enclosing config directory as a `..`-relative path (`..`,
+  `../..`) — 0 or 1 entry, not every ancestor. `findUp` counts the CWD itself as a
+  hit; that case is dropped (walk-down already covers the CWD and below), so
+  find-up only ever yields a strict ancestor.
+
+So from `/sub` with `/deno.json` + `/sub/deno.json`, `configDirs` returns just `.`
+(the CWD's own config shadows the ancestor); from `/sub` with only `/deno.json`,
+it returns `..` (the strict ancestor); from the root with `/deno.json` +
+`/sub/deno.json` it returns `.` and `sub`.
 
 The **workspace-wide verbs run on the cone only** — the caller's own project plus
-descendants (paths without a `..`), never the ancestors. A `@check` shouldn't
-reach up into a parent project you're nested inside, and a `Changeset` rooted at
-the caller's location can't represent changes *above* it (a `..` path collapses).
-So `projects`/`workspaces` list ancestors for context, but `lintAll` … `formatAll`
-filter to `inCone(dir) = !dir.hasPrefix("..")`.
+descendants, never the ancestors. A `@check` shouldn't reach up into a parent
+project you're nested inside, and a `Changeset` rooted at the caller's location
+can't represent changes *above* it (a `..` path collapses). The two walks label
+this for free: walk-down hits stay within the cwd (no `..`) while find-up hits are
+`..`-relative, so `projects`/`workspaces` list the ancestor for context but
+`lintAll` … `formatAll` filter to `inCone(dir) = !dir.hasPrefix("..")`.
 
 **`container` — mount the *workspace root*, set workdir to the member (v0.2):**
 
@@ -695,8 +713,10 @@ supplying the `@up` service the base module intentionally leaves to them.
 - [x] introspection: `config` / `source` / `container`
 - [x] multi-file layout (`deno.dang`, `deno-project.dang`)
 - [x] e2e tests (`.dagger/modules/e2e`) + `README.md`
-- [x] discovery relative to the caller's location: `projects(ws)` = self + descendants
-      (glob from `.`) + ancestors (walk up to the workspace root), cwd-relative paths
+- [x] discovery relative to the caller's location, via the reusable
+      `findConfigDirs(filenames, exclude)` helper from the `polyfill` module
+      (dagger/dagger#13688): `projects(ws)` = self + descendants (glob from `.`) +
+      nearest enclosing ancestor (`ws.findUp`), all CWD-relative
 - [x] `*All` bulk verbs: `lintAll`/`testAll`/`typeCheckAll`/`formatCheckAll` + `formatAll`
       generator, scoped to the caller's cone (ancestors excluded)
 - [x] install DX: `dagger check` / `dagger generate` auto-run the `*All` verbs
