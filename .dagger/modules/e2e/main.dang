@@ -312,4 +312,39 @@ type E2e {
     )
     null
   }
+
+  """
+  A strict ancestor — a project the caller lives under, with no config at the CWD
+  itself — is found by find-up (as a ".."-relative path) yet stays out of the
+  cone, so the workspace-wide verbs skip it. Complements `subdirScopeCheck`, whose
+  CWD holds its own config and thus shadows the ancestor before it is ever
+  discovered; here the CWD has no config, so the ancestor really is discovered and
+  must still be excluded.
+  """
+  pub ancestorExcludedCheck(): Void @check {
+    # Dirty ancestor, clean descendant. From `/work` (no config of its own) the root
+    # is a discovered strict ancestor and `work/pkg` is the cone, so a dirty ancestor
+    # must not fail the checks.
+    let dirtyAncestor = directory
+      .withNewFile("deno.json", "{}\n")
+      .withNewFile("mod.ts", "export function f(a:number){return a}\n")
+      .withNewFile("work/pkg/deno.json", "{}\n")
+      .withNewFile("work/pkg/mod.ts", "export const ok = 1;\n")
+    assert(
+      try { deno().formatCheckAll(dirtyAncestor.asWorkspace(cwd: "work")); true } catch { err => false },
+      "from /work: a discovered but out-of-cone ancestor must not fail the checks",
+    )
+
+    # Clean ancestor, dirty descendant: the descendant is in the cone, so it fails.
+    let dirtyDescendant = directory
+      .withNewFile("deno.json", "{}\n")
+      .withNewFile("mod.ts", "export const ok = 1;\n")
+      .withNewFile("work/pkg/deno.json", "{}\n")
+      .withNewFile("work/pkg/mod.ts", "export function f(a:number){return a}\n")
+    assert(
+      try { deno().formatCheckAll(dirtyDescendant.asWorkspace(cwd: "work")); false } catch { err => true },
+      "from /work: a descendant in the cone must be checked, so a dirty one fails",
+    )
+    null
+  }
 }
