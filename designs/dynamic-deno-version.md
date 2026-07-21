@@ -46,16 +46,29 @@ Two engine features combine into a rolling pin:
    example usage in
    [`test-directives/main.dang`](https://github.com/dagger/dagger/blob/main/core/integration/testdata/modules/dang/test-directives/main.dang#L64)).
 2. **Self calls** — a module can call its own API rather than inlining the call.
-   This is the part that matters: a plain local call (`defaultBase()`) is
+   This is the part that matters: a plain local call (`latestImage()`) is
    evaluated inline by the Dang interpreter and **never touches the function
-   cache**. Only a call routed through the API (`deno.defaultBase`) is a cached
+   cache**. Only a call routed through the API (`deno.latestImage`) is a cached
    function call.
 
-So: put the image resolution in a `@cache`d function, and reach it from `base`
-via a self call. `container.from("denoland/deno:alpine")` resolves the mutable
-tag to a digest once; the engine then serves that same resolved `Container` for
-the TTL. Everyone on that engine builds against one digest for a week, then it
-rolls forward on its own.
+So: put the bare image pull in a `@cache`d function, and reach it through a self
+call. `container.from("denoland/deno:alpine")` resolves the mutable tag to a
+digest once; the engine then serves that same resolved `Container` for the TTL.
+Everyone on that engine builds against one digest for a week, then it rolls
+forward on its own.
+
+**`base` itself does not self-call.** It keeps exactly the shape it has today —
+a container expression with `.withoutEntrypoint` and the `DENO_NO_UPDATE_CHECK`
+env var layered on — and only the `container.from(...)` at the bottom is swapped
+for a call to a small private function that holds the self call. Two reasons:
+
+- the cached function stays a *bare* pull, so its cache key is nothing but "the
+  latest alpine image". Layering our tweaks inside it would cache them too, and
+  every future tweak would be a cache-shape change;
+- a field default is the one place a self call is riskiest (see §7.1); putting it
+  in a function body defers it to call time.
+
+Function bodies have no such constraint, so `install` self-calls directly.
 
 `ttl: "168h"` (7 days) is also `MaxFunctionCacheTTLSeconds`
 ([`core/modfunc.go`](https://github.com/dagger/dagger/blob/main/core/modfunc.go#L26)),
@@ -98,38 +111,48 @@ type Deno {
   """
   Base container for Deno commands. Defaults to the latest published
   denoland/deno:alpine image, re-resolved at most once a week (see
-  `defaultBase`). Override to pin an exact release, or to bring your own image —
-  it must have `deno` on PATH, or pass it through `install` first.
+  `latestImage`). Override to bring your own image or pin an exact release — it
+  must have `deno` on PATH, or pass it through `install` first.
   """
-  pub base: Container! = deno.defaultBase
-
-  """
-  The latest published Deno image. Resolved through a self call so the result
-  goes through the function cache: `denoland/deno:alpine` is a mutable tag, but
-  the resolved digest is held for the TTL, so every command in the workspace runs
-  against one Deno build for a week before rolling forward.
-  """
-  @cache(ttl: "168h")
-  pub defaultBase(): Container! {
-    container
-      .from("denoland/deno:alpine")
+  pub base: Container! =
+    denoImage()
       .withoutEntrypoint
       .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
+
+  """
+  The latest Deno image, reached through a self call so the pull goes through
+  the function cache rather than being inlined. Exists as a separate function
+  because `base` is a field default, and a self call belongs in a function body.
+  """
+  let denoImage(): Container! { deno.latestImage }
+
+  """
+  The latest published Deno image, cached for a week. `denoland/deno:alpine` is
+  a mutable tag; holding the resolved digest for the TTL means every command in
+  the workspace runs against one Deno build for a week before rolling forward.
+
+  Deliberately a bare pull — no entrypoint or env tweaks — so the cache key is
+  nothing but "the latest alpine image". `base` layers our defaults on top.
+  """
+  @cache(ttl: "168h")
+  pub latestImage(): Container! {
+    container.from("denoland/deno:alpine")
   }
 
   """
   The `deno` binary from the latest published denoland/deno:bin image. Same
-  rolling-pin treatment as `defaultBase`.
+  rolling-pin treatment as `latestImage`.
   """
   @cache(ttl: "168h")
-  pub denoBinary(): File! {
+  pub latestBinary(): File! {
     container.from("denoland/deno:bin").file("/deno")
   }
 
   pub install(ctr: Container!): Container! {
     ctr
       # 493 == 0o755; Dang has no octal literals.
-      .withFile("/usr/local/bin/deno", deno.denoBinary, permissions: 493)
+      # A function body can self-call directly; only field defaults need a wrapper.
+      .withFile("/usr/local/bin/deno", deno.latestBinary, permissions: 493)
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
   }
@@ -206,16 +229,17 @@ base = "docker.io/denoland/deno:alpine-2.9.3"
 
 **`dagger/deno`**
 
-- [ ] `deno.dang`: remove `pub version`; add `defaultBase` + `denoBinary`
-      (`@cache(ttl: "168h")`); `base` self-calls `defaultBase`; `install` uses
-      `denoBinary`; add read-only `version()`.
+- [ ] `deno.dang`: remove `pub version`; add `latestImage` + `latestBinary`
+      (`@cache(ttl: "168h")`, bare pulls) and the private `denoImage()` wrapper;
+      `base` keeps its current shape on top of `denoImage()`; `install`
+      self-calls `latestBinary`; add read-only `version()`.
 - [ ] `deno-project.dang`, `deno-workspace.dang`: drop `version` / `numGte` /
       `supportsPermissionSets`; `test` and `compile` always use `-P`.
 - [ ] `README.md`: drop `settings.version` (L52), the 2.5.0 fallback paragraph
       (L152), `--version 2.9.3` (L216) and `deno(version: "2.9.3")` (L242);
       reframe "reproducible toolchains" (L13) as *latest, refreshed weekly,
       pinnable via `base`*.
-- [ ] e2e: cover `defaultBase` resolving and `version()` reporting a real
+- [ ] e2e: cover `latestImage` resolving and `version()` reporting a real
       release; make sure nothing asserts a literal version string.
 - [ ] Bump `engineVersion` to whatever release carries #13693.
 
@@ -232,19 +256,26 @@ base = "docker.io/denoland/deno:alpine-2.9.3"
 
 ## 7. To verify once #13693 lands
 
-1. **Does the field default recurse?** `base`'s default self-calls the `deno`
-   constructor, which itself has to produce a default for `base`. If defaults are
-   evaluated eagerly at construction, that's unbounded. If it does recurse, fall
-   back to shape B — a nullable setting resolved at the point of use, which never
-   constructs `Deno` while constructing `Deno`:
+1. **Does `base`'s default recurse?** The `denoImage()` wrapper keeps the self
+   call out of the field default's own expression, but the call it makes still
+   reaches the `deno` constructor, which has to produce a default for `base`. If
+   defaults are evaluated eagerly at construction, that's unbounded; if
+   `denoImage()` is only run when `base` is read, it's fine. This is the single
+   assumption the whole design rests on — test it first.
+
+   If it does recurse, fall back to a nullable setting resolved at the point of
+   use, which never constructs `Deno` while constructing `Deno`:
 
    ```dang
    pub base: Container = null              # unset = track latest
-   let toolchain(): Container! { base ?? deno.defaultBase }
+   let toolchain(): Container! {
+     base ?? denoImage().withoutEntrypoint.withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
+   }
    ```
 
-   Shape A is preferred purely for DX (`dagger call deno base` returns something,
-   and `DenoProject.base` stays `Container!`); B is the safe landing spot.
+   Costs some DX (`dagger call deno base` returns null by default, and
+   `DenoProject.base` has to become nullable or take the resolved container), so
+   it's the fallback, not the plan.
 2. **Is the TTL actually honoured for a self call from inside the same module?**
    Confirm two calls a minute apart reuse one resolved digest, and that the
    cached `Container` carries the pinned digest rather than re-resolving the
