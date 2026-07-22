@@ -92,13 +92,18 @@ Verified end to end on `main`:
 
 | shape | result |
 |---|---|
-| `pub base: Container! { Deno.latestImage.withoutEntrypoint }` (computed field) | ✅ returns a container |
-| `pub base: Container = null` + `toolchain { base ?? Deno.latestImage… }` | ✅ returns latest when unset |
+| `pub base: Container! { Deno.latestImage.withoutEntrypoint }` (computed field) | ✅ returns a container, but **not overridable** |
+| `pub base: Container = null` + `toolchain { base ?? Deno.latestImage… }` | ✅ returns latest when unset, **overridable** |
 | `pub base: Container! = Deno.latestImage…` (field default) | ❌ hangs on read |
 
 The computed-field form (top row) is the shortest and is what the repro used, but
-it makes `base` **non-settable** — you can't pin it. §4.1 uses the middle form so
-`base` stays an overridable setting.
+a computed field is read-only: with `base = "…debian…"` in settings the override
+is **silently ignored** (still resolves the body's alpine), and there's no
+`--base` flag (`unknown flag: --base`) — both verified. Only a *settable* field
+gets a setting and a `--base` flag, and a settable field can't self-call in its
+default (row 3 hangs). So §4.1 keeps `base` a plain nullable setting and moves the
+self call into `toolchain` (middle row): with the same `base = "…debian…"` setting
+it correctly resolves debian, unset resolves alpine.
 
 ## 4. Proposed implementation
 
