@@ -281,11 +281,15 @@ Tested with the **real deno module** (`dagger-module.toml`, `dang` runtime,
 3. **A `=` field default with a self call hangs on read.** The module loads, but
    reading that field never returns — so `base` cannot be a `= self-call` default;
    it has to be a plain setting resolved in `toolchain`.
+4. **A nullable `base: Container = null` is fully overridable.** With
+   `base = "docker.io/library/debian:latest"` under `[modules.<mod>.settings]`,
+   `toolchain` resolves the override (debian) instead of the default (alpine);
+   the `--base <ref>` constructor arg works too. (Settings only apply when the
+   module is invoked by its workspace name, e.g. `dagger call deno …` — not via
+   an ad-hoc `-m <path>` load.) So unset → latest, set → the pin.
 
 Still to confirm before/while implementing:
 
-4. **`base` override still works** when it's nullable (`Container = null`). The
-   unset path is verified; a settings/`--base` override isn't yet.
 5. **Is the TTL honoured across calls?** Confirm two calls a minute apart reuse
    one resolved digest, and the cached `Container` carries the pinned digest
    rather than re-resolving `denoland/deno:alpine` downstream.
