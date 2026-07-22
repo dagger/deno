@@ -1,7 +1,7 @@
 # Design: drop the `version` setting, track the latest Deno release
 
-· Status: **proposed** — #13693 merged, but now blocked on the `dang-sdk` module
-enabling self calls (see §3, blocker #2) 
+· Status: **proposed** — #13693 merged, but now blocked: self calls can't be
+enabled for a `dagger-module.toml` module (see §3, blocker #2) 
 · Supersedes: [#2](https://github.com/dagger/deno/pull/2) — *automatic Deno version bumps* (closed unmerged) 
 · Touches: `deno.dang`, `deno-project.dang`, `deno-workspace.dang`, `README.md`,
 and `docs/current_docs/modules/deno.mdx` in `dagger/dagger`
@@ -70,9 +70,9 @@ explicitly rather than raising it.
 
 ### Status: two blockers, both found by testing against `main`
 
-#13693 is merged (`main` @ `d813ed77`). Probing it with throwaway modules turned
-the §7 open questions into hard facts — and surfaced a blocker the design didn't
-anticipate:
+#13693 is merged (tested against `main` @ `d813ed77` / `d0a3d273`). Probing it
+with throwaway modules — and the real deno module — turned the §7 open questions
+into hard facts, and surfaced a blocker the design didn't anticipate:
 
 1. **A self call in a field default recurses forever.** `pub base = deno.latestImage…`
    hangs indefinitely — even a call to an *unrelated* function hangs, so the
@@ -80,17 +80,26 @@ anticipate:
    constructor re-enters the constructor without end. This kills "keep `base`'s
    shape, just swap the pull". A self call has to live in a **function body**,
    evaluated at call time. §4.1 is rewritten around that.
-2. **The `deno` SDK doesn't enable self calls, and TOML can't turn them on.**
-   A self call from a function body works *only* under the built-in `dang` SDK
-   with `experimental.SELF_CALLS: true` in a legacy `dagger.json`. This repo uses
-   `github.com/dagger/dang-sdk` installed via `[…as-sdk]` on the new
-   `dagger-module.toml`, where the whole `experimental` block is dropped
-   (`toml:"-"`, commented "self-calls graduated"). Under that setup the self call
-   fails inference — `Error: "probe" not found`. Enablement now flows only through
-   the SDK advertising `AlwaysEnablesSelfCalls()`; the built-in Go `dangSDK` does,
-   but the `dang-sdk` **module** does not. **This is the real gate** — until the
-   `dang-sdk` module (or the engine's handling of it) enables self calls, none of
-   this is buildable in `dagger/deno`, field default or not.
+2. **Self calls still require `experimental.SELF_CALLS: true`, and the TOML
+   config format can't express it.** A function-body self call works *only* when
+   that flag is set, which is possible *only* in a legacy `dagger.json`. Isolated
+   by testing (all on the same engine, function-body form):
+
+   | SDK source | config | flag | result |
+   |---|---|---|---|
+   | builtin `dang` | `dagger.json` | `SELF_CALLS: true` | ✅ works |
+   | builtin `dang` | `dagger.json` | *(none)* | ❌ `"probe" not found` |
+   | `dang` (this repo, `[…as-sdk]`) | `dagger-module.toml` | *(none)* | ❌ `"deno" not found` |
+
+   The new `dagger-module.toml` schema drops the whole `experimental` block
+   (`toml:"-"`, commented "self-calls graduated"), so a TOML module has no way to
+   turn the flag on. And the "graduated" auto-enable — `dangSDK` advertising
+   `AlwaysEnablesSelfCalls()` — does **not** take effect on the running engine:
+   the builtin `dang` SDK without the flag still fails. So on `main` today, **no
+   TOML-format module can enable self calls at all**, `dagger/deno` included.
+   **This is the real gate.** It needs an engine/SDK fix (make the `dang` runtime
+   genuinely enable self calls without the legacy flag, or restore a TOML way to
+   request them) before any of this is buildable here.
 
 What *does* work (verified): `@cache(ttl:)` compiling to a real TTL, and a
 self call from a function body under the built-in SDK returning a cached,
@@ -232,12 +241,14 @@ base = "docker.io/denoland/deno:alpine-2.9.3"
 
 ## 6. Work items
 
-**`dagger/dagger` / `dagger-dang-sdk` — the gate (blocker #2)**
+**`dagger/dagger` — the gate (blocker #2)**
 
-- [ ] Make the `github.com/dagger/dang-sdk` module enable self calls the way the
-      built-in `dang` SDK does (advertise `AlwaysEnablesSelfCalls`, or have the
-      engine treat the dang runtime as always-self-calls even via the `[…as-sdk]`
-      module path). Without this, nothing below is buildable in this repo.
+- [ ] Make the `dang` runtime enable self calls for a `dagger-module.toml` module
+      without the legacy `experimental.SELF_CALLS` flag — i.e. make the
+      "graduated"/`AlwaysEnablesSelfCalls` path actually take effect on the
+      running engine (or restore a TOML way to request self calls). Verified today
+      that even the builtin `dang` SDK needs the flag, and TOML can't set it, so
+      nothing below is buildable in this repo until this is fixed.
 
 **`dagger/deno`** (unblocked only after the gate above)
 
@@ -280,8 +291,10 @@ Probed with throwaway modules (built-in `dang` SDK, legacy `dagger.json`,
 2. **Self call in a function body → works.** `probe.latestImage.withExec(["deno","--version"])`
    returned `deno 2.9.3` in ~9s. Zero-arg self calls are written **without**
    parens (`probe.latestImage`), matching the upstream example.
-3. **Under this repo's SDK (`dang-sdk` module + TOML) → `Error: "probe" not found`.**
-   The same function-body self call fails inference — this is blocker #2 in §3.
+3. **Enablement (blocker #2).** Function-body self call works only with
+   `experimental.SELF_CALLS: true` in a legacy `dagger.json`; the builtin `dang`
+   SDK without the flag fails, and the real deno module (TOML, no way to set the
+   flag) fails with `Error: "deno" not found`. See the table in §3.
 
 Still genuinely open:
 
