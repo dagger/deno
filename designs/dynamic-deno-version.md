@@ -83,10 +83,19 @@ Two things had to be right:
    this doc were wrong to conclude self calls were disabled — that was this typo.
 2. **Resolve in a body, never in a field default.** A self call in a `=` default
    (`pub base: Container! = Deno.latestImage…`) hangs indefinitely when the field
-   is *read* — the self call re-enters the module and never settles. (The module
-   still *loads* fine; only reading that field hangs, so it's a read-time loop,
-   not eager construction.) The fix is to keep the setting free of self calls and
-   resolve in a computed field / `let` function, which is exactly §4.1.
+   is *read* — the self call re-enters module construction, which re-evaluates
+   `base`'s default, which self-calls again: a read-time loop. (The module still
+   *loads* fine; only reading that field hangs.) The fix is to keep the setting
+   free of self calls and resolve in a computed field, which is exactly §4.1.
+
+   Why today's `base` is fine and this isn't: today's default is
+   `= container.from("denoland/deno:alpine-" + version)…` — a `=` settable field
+   whose expression is a **builtin** (`container`), inlined, no self call, so it
+   neither loops nor loses its override. The loop only appears when the default
+   becomes "latest via the cache", i.e. a **self call**. At that point you can't
+   keep both properties in one field: a `=` default self-call loops, and a
+   computed-field `{ }` (the only self-call-safe home) isn't overridable. Hence
+   the split — settable `base`, self-call in `toolchain`.
 
 Verified end to end on `main`:
 
