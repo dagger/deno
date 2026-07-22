@@ -1,7 +1,7 @@
 # Design: drop the `version` setting, track the latest Deno release
 
-· Status: **proposed** — #13693 merged, but now blocked: self calls can't be
-enabled for a `dagger-module.toml` module (see §3, blocker #2) 
+· Status: **proposed** — #13693 merged; self calls verified working on `main`
+with this repo's `dagger-module.toml` setup (see §3). Ready to implement. 
 · Supersedes: [#2](https://github.com/dagger/deno/pull/2) — *automatic Deno version bumps* (closed unmerged) 
 · Touches: `deno.dang`, `deno-project.dang`, `deno-workspace.dang`, `README.md`,
 and `docs/current_docs/modules/deno.mdx` in `dagger/dagger`
@@ -47,10 +47,12 @@ Two engine features combine into a rolling pin:
    example usage in
    [`test-directives/main.dang`](https://github.com/dagger/dagger/blob/main/core/integration/testdata/modules/dang/test-directives/main.dang#L64)).
 2. **Self calls** — a module can call its own API rather than inlining the call.
-   This is the part that matters: a plain local call (`latestImage()`) is
+   This is the part that matters: a plain local call (`latestImage`) is
    evaluated inline by the Dang interpreter and **never touches the function
-   cache**. Only a call routed through the API (`deno.latestImage`) is a cached
-   function call.
+   cache**. Only a call routed through the API is a cached function call, and it
+   is written against the module's **type name** — `Deno.latestImage`, *not* the
+   lowercase constructor `deno`. (This bit me for several rounds: `deno.latestImage`
+   fails with `Error: "deno" not found`; `Deno.latestImage` resolves.)
 
 So: put the bare image pull in a `@cache`d function, and reach it through a self
 call from a *function body*. `container.from("denoland/deno:alpine")` resolves
@@ -60,7 +62,7 @@ week, then it rolls forward on its own.
 
 The cached function stays a *bare* pull so its cache key is nothing but "the
 latest alpine image"; the `.withoutEntrypoint` / `DENO_NO_UPDATE_CHECK` tweaks
-are layered on *outside* it (in `toolchain()` below) so a future tweak never
+are layered on *outside* it (in `toolchain` below) so a future tweak never
 becomes a cache-shape change.
 
 `ttl: "168h"` (7 days) is also `MaxFunctionCacheTTLSeconds`
@@ -68,42 +70,35 @@ becomes a cache-shape change.
 the implicit cap on `Default`-policy results — so we're stating the maximum
 explicitly rather than raising it.
 
-### Status: two blockers, both found by testing against `main`
+### Status: verified working, with one shape constraint
 
-#13693 is merged (tested against `main` @ `d813ed77` / `d0a3d273`). Probing it
-with throwaway modules — and the real deno module — turned the §7 open questions
-into hard facts, and surfaced a blocker the design didn't anticipate:
+#13693 is merged. Tested against `main` (@ `1862b24f`) with **the real deno
+module** and a standalone repro, both on this repo's exact setup —
+`dagger-module.toml`, `[runtime] source = "dang"`, `dang-sdk` installed via
+`[…as-sdk]`. Self calls **work**; no experimental flag, no legacy `dagger.json`.
+Two things had to be right:
 
-1. **A self call in a field default recurses forever.** `pub base = deno.latestImage…`
-   hangs indefinitely — even a call to an *unrelated* function hangs, so the
-   default is evaluated **eagerly at construction**, and self-calling the `deno`
-   constructor re-enters the constructor without end. This kills "keep `base`'s
-   shape, just swap the pull". A self call has to live in a **function body**,
-   evaluated at call time. §4.1 is rewritten around that.
-2. **Self calls still require `experimental.SELF_CALLS: true`, and the TOML
-   config format can't express it.** A function-body self call works *only* when
-   that flag is set, which is possible *only* in a legacy `dagger.json`. Isolated
-   by testing (all on the same engine, function-body form):
+1. **Call the type, not the constructor.** `Deno.latestImage` resolves;
+   `deno.latestImage` fails with `Error: "deno" not found`. Earlier rounds of
+   this doc were wrong to conclude self calls were disabled — that was this typo.
+2. **Resolve in a body, never in a field default.** A self call in a `=` default
+   (`pub base: Container! = Deno.latestImage…`) hangs indefinitely when the field
+   is *read* — the self call re-enters the module and never settles. (The module
+   still *loads* fine; only reading that field hangs, so it's a read-time loop,
+   not eager construction.) The fix is to keep the setting free of self calls and
+   resolve in a computed field / `let` function, which is exactly §4.1.
 
-   | SDK source | config | flag | result |
-   |---|---|---|---|
-   | builtin `dang` | `dagger.json` | `SELF_CALLS: true` | ✅ works |
-   | builtin `dang` | `dagger.json` | *(none)* | ❌ `"probe" not found` |
-   | `dang` (this repo, `[…as-sdk]`) | `dagger-module.toml` | *(none)* | ❌ `"deno" not found` |
+Verified end to end on `main`:
 
-   The new `dagger-module.toml` schema drops the whole `experimental` block
-   (`toml:"-"`, commented "self-calls graduated"), so a TOML module has no way to
-   turn the flag on. And the "graduated" auto-enable — `dangSDK` advertising
-   `AlwaysEnablesSelfCalls()` — does **not** take effect on the running engine:
-   the builtin `dang` SDK without the flag still fails. So on `main` today, **no
-   TOML-format module can enable self calls at all**, `dagger/deno` included.
-   **This is the real gate.** It needs an engine/SDK fix (make the `dang` runtime
-   genuinely enable self calls without the legacy flag, or restore a TOML way to
-   request them) before any of this is buildable here.
+| shape | result |
+|---|---|
+| `pub base: Container! { Deno.latestImage.withoutEntrypoint }` (computed field) | ✅ returns a container |
+| `pub base: Container = null` + `toolchain { base ?? Deno.latestImage… }` | ✅ returns latest when unset |
+| `pub base: Container! = Deno.latestImage…` (field default) | ❌ hangs on read |
 
-What *does* work (verified): `@cache(ttl:)` compiling to a real TTL, and a
-self call from a function body under the built-in SDK returning a cached,
-digest-pinned `Container`. The mechanism is sound; the packaging is blocked.
+The computed-field form (top row) is the shortest and is what the repro used, but
+it makes `base` **non-settable** — you can't pin it. §4.1 uses the middle form so
+`base` stays an overridable setting.
 
 ## 4. Proposed implementation
 
@@ -111,7 +106,9 @@ digest-pinned `Container`. The mechanism is sound; the packaging is blocked.
 
 A self call can't live in a field default (blocker #1), so `base` becomes a
 **nullable setting** — unset means "track latest" — and the resolution happens in
-a `toolchain()` function body, which is where the self call is legal.
+a `toolchain` computed field, which is where the self call is legal. Self calls
+are written against the **type name** (`Deno.latestImage`). The self-call and
+computed-field forms below are the ones **verified on `main`** (§3).
 
 ```dang
 type Deno {
@@ -125,12 +122,12 @@ type Deno {
 
   """
   The container every verb builds on: the override if set, otherwise the latest
-  image with our defaults layered on. A `let` function (not a field default) so
-  the self call to `latestImage` is evaluated at call time, not at construction —
-  a self call in a field default recurses forever (see §3).
+  image with our defaults layered on. A computed field, not a field default, so
+  the `Deno.latestImage` self call runs when the field is read — a self call in a
+  `=` default hangs on read (see §3).
   """
-  let toolchain(): Container! {
-    base ?? deno.latestImage
+  let toolchain: Container! {
+    base ?? Deno.latestImage
       .withoutEntrypoint
       .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
   }
@@ -144,7 +141,7 @@ type Deno {
   nothing but "the latest alpine image". `toolchain` layers our defaults on top.
   """
   @cache(ttl: "168h")
-  pub latestImage(): Container! {
+  pub latestImage: Container! {
     container.from("denoland/deno:alpine")
   }
 
@@ -153,14 +150,14 @@ type Deno {
   rolling-pin treatment as `latestImage`.
   """
   @cache(ttl: "168h")
-  pub latestBinary(): File! {
+  pub latestBinary: File! {
     container.from("denoland/deno:bin").file("/deno")
   }
 
   pub install(ctr: Container!): Container! {
     ctr
       # 493 == 0o755; Dang has no octal literals.
-      .withFile("/usr/local/bin/deno", deno.latestBinary, permissions: 493)
+      .withFile("/usr/local/bin/deno", Deno.latestBinary, permissions: 493)
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
   }
@@ -168,8 +165,8 @@ type Deno {
   """
   The Deno release the toolchain actually runs, e.g. "2.9.3".
   """
-  pub version(): String! {
-    let out = toolchain().withExec(["deno", "--version"]).stdout
+  pub version: String! {
+    let out = toolchain.withExec(["deno", "--version"]).stdout
     (out.split("\n")[0] ?? "").split(" ")[1] ?? ""
   }
 
@@ -179,9 +176,9 @@ type Deno {
 
 `version` survives as a **read-only report** (the mdx already documents it as
 "prints the configured toolchain version"), not as a setting. It's derived from
-`toolchain()`, so it stays correct whether `base` is overridden or tracking latest.
+`toolchain`, so it stays correct whether `base` is overridden or tracking latest.
 
-`project` / `workspace` pass **`toolchain()`** (the resolved `Container!`) into
+`project` / `workspace` pass **`toolchain`** (the resolved `Container!`) into
 `DenoProject` / `DenoWorkspace` where they used to pass `base`. The self call
 resolves once, in `Deno`, and the members receive a plain container — they never
 self-call, so nothing changes on their side beyond the field they store.
@@ -190,7 +187,7 @@ self-call, so nothing changes on their side beyond the field they store.
 
 Delete `let version: String!`, `numGte`, and `supportsPermissionSets`, and drop
 `version:` from every constructor call (the `base` field they already take now
-carries the resolved `toolchain()` container). `test` and `compile` then always
+carries the resolved `toolchain` container). `test` and `compile` then always
 send `-P`:
 
 ```dang
@@ -241,32 +238,24 @@ base = "docker.io/denoland/deno:alpine-2.9.3"
 
 ## 6. Work items
 
-**`dagger/dagger` — the gate (blocker #2)**
-
-- [ ] Make the `dang` runtime enable self calls for a `dagger-module.toml` module
-      without the legacy `experimental.SELF_CALLS` flag — i.e. make the
-      "graduated"/`AlwaysEnablesSelfCalls` path actually take effect on the
-      running engine (or restore a TOML way to request self calls). Verified today
-      that even the builtin `dang` SDK needs the flag, and TOML can't set it, so
-      nothing below is buildable in this repo until this is fixed.
-
-**`dagger/deno`** (unblocked only after the gate above)
+**`dagger/deno`**
 
 - [ ] `deno.dang`: remove `pub version`; make `base` a nullable setting
-      (`Container = null`); add `toolchain()` (`base ?? deno.latestImage…`),
+      (`Container = null`); add `toolchain` (`base ?? Deno.latestImage…`),
       `latestImage` + `latestBinary` (`@cache(ttl: "168h")`, bare pulls);
-      `install` uses `deno.latestBinary`; add read-only `version()` off
-      `toolchain()`; verbs and members build on `toolchain()`.
+      `install` uses `Deno.latestBinary`; add read-only `version` off
+      `toolchain`; verbs and members build on `toolchain`. Self calls use the
+      **type name** `Deno.…`, never `deno.…`.
 - [ ] `deno-project.dang`, `deno-workspace.dang`: drop `version` / `numGte` /
-      `supportsPermissionSets`; take the resolved `toolchain()` container in
+      `supportsPermissionSets`; take the resolved `toolchain` container in
       place of `base`; `test` and `compile` always use `-P`.
 - [ ] `README.md`: drop `settings.version` (L52), the 2.5.0 fallback paragraph
       (L152), `--version 2.9.3` (L216) and `deno(version: "2.9.3")` (L242);
       reframe "reproducible toolchains" (L13) as *latest, refreshed weekly,
       pinnable via `base`*.
-- [ ] e2e: cover `latestImage` resolving and `version()` reporting a real
+- [ ] e2e: cover `latestImage` resolving and `version` reporting a real
       release; make sure nothing asserts a literal version string.
-- [ ] Bump `engineVersion` to whatever release carries #13693.
+- [ ] Bump `engineVersion` to a release that carries #13693.
 
 **`dagger/dagger`**
 
@@ -279,28 +268,27 @@ base = "docker.io/denoland/deno:alpine-2.9.3"
       paragraph so `version` reads as *reports* the toolchain version, not
       *configures* it.
 
-## 7. Verified against `main` @ `d813ed77`
+## 7. Verified against `main` @ `1862b24f`
 
-Probed with throwaway modules (built-in `dang` SDK, legacy `dagger.json`,
-`experimental.SELF_CALLS: true`):
+Tested with the **real deno module** (`dagger-module.toml`, `dang` runtime,
+`dang-sdk` via `[…as-sdk]`) and a standalone repro — no experimental flag:
 
-1. **Self call in a field default → infinite recursion.** `pub base = probe.latestImage…`
-   hangs; so does an unrelated `ping()` with that default present, proving the
-   default is evaluated eagerly at construction. **Answered:** field-default shape
-   is out; §4.1 resolves in `toolchain()` instead.
-2. **Self call in a function body → works.** `probe.latestImage.withExec(["deno","--version"])`
-   returned `deno 2.9.3` in ~9s. Zero-arg self calls are written **without**
-   parens (`probe.latestImage`), matching the upstream example.
-3. **Enablement (blocker #2).** Function-body self call works only with
-   `experimental.SELF_CALLS: true` in a legacy `dagger.json`; the builtin `dang`
-   SDK without the flag fails, and the real deno module (TOML, no way to set the
-   flag) fails with `Error: "deno" not found`. See the table in §3.
+1. **Self calls work with `dagger-module.toml`** — using the type name.
+   `Deno.latestImage` resolves; `deno.latestImage` fails `"deno" not found`. The
+   earlier "self calls need the legacy flag" conclusion was a typo, now retracted.
+2. **`base ?? Deno.latestImage…` in a computed field returns the latest image**
+   when `base` is unset. This is §4.1's shape, run end to end.
+3. **A `=` field default with a self call hangs on read.** The module loads, but
+   reading that field never returns — so `base` cannot be a `= self-call` default;
+   it has to be a plain setting resolved in `toolchain`.
 
-Still genuinely open:
+Still to confirm before/while implementing:
 
-4. **Is the TTL honoured across calls?** Not yet measured — confirm two calls a
-   minute apart reuse one resolved digest, and the cached `Container` carries the
-   pinned digest rather than re-resolving `denoland/deno:alpine` downstream.
-5. **`denoland/deno:alpine` and `:bin` are the right mutable tags** for "latest
+4. **`base` override still works** when it's nullable (`Container = null`). The
+   unset path is verified; a settings/`--base` override isn't yet.
+5. **Is the TTL honoured across calls?** Confirm two calls a minute apart reuse
+   one resolved digest, and the cached `Container` carries the pinned digest
+   rather than re-resolving `denoland/deno:alpine` downstream.
+6. **`denoland/deno:alpine` and `:bin` are the right mutable tags** for "latest
    stable" (vs `:latest`, `:distroless`).
-6. **Is 7 days the right TTL,** or is 24h better given the per-engine caveat (§5)?
+7. **Is 7 days the right TTL,** or is 24h better given the per-engine caveat (§5)?
