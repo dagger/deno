@@ -13,14 +13,10 @@ type DenoWorkspace {
   pub path: String!
 
   """
-  Base container carrying the Deno toolchain, inherited from the Deno root.
+  Base container carrying the Deno toolchain, inherited from the Deno root
+  (its resolved `toolchain`).
   """
   let base: Container!
-
-  """
-  Deno version configured on the root, used to gate version-specific flags.
-  """
-  let version: String!
 
   """
   The workspace's root deno.json / deno.jsonc file.
@@ -84,36 +80,8 @@ type DenoWorkspace {
           path: if (path == ".") { dir } else { path + "/" + dir },
           workspaceRoot: path,
           base: base,
-          version: version,
         )
       }
-  }
-
-  """
-  Numeric >= for two non-negative integer strings without leading zeros: the
-  longer one is larger, and equal lengths compare lexically.
-  """
-  let numGte(a: String!, b: String!): Boolean! {
-    let da = a.split("").length
-    let db = b.split("").length
-    if (da != db) { da > db } else { a >= b }
-  }
-
-  """
-  Whether the configured Deno version supports config-file permission sets and
-  the `-P` flag (added in Deno 2.5.0). Compares the version's major.minor.
-  """
-  let supportsPermissionSets(): Boolean! {
-    let parts = version.split(".")
-    let major = parts[0] ?? "0"
-    let minor = if (parts.length > 1) { parts[1] ?? "0" } else { "0" }
-    if (numGte(major, "3")) {
-      true
-    } else if (major == "2") {
-      numGte(minor, "5")
-    } else {
-      false
-    }
   }
 
   """
@@ -126,12 +94,10 @@ type DenoWorkspace {
 
   """
   Test every member of the workspace (`deno test`). Permissions come from each
-  member's deno.json (`test.permissions`) via `-P`, not from arguments; below
-  Deno 2.5.0 (no `-P`) it falls back to `-A`.
+  member's deno.json (`test.permissions`) via `-P`, not from arguments.
   """
   pub test(ws: Workspace!): Void @check {
-    let permissionFlag = if (supportsPermissionSets()) { "-P" } else { "-A" }
-    container(ws).withExec(["deno", "test", "--permit-no-files", permissionFlag]).sync
+    container(ws).withExec(["deno", "test", "--permit-no-files", "-P"]).sync
     null
   }
 

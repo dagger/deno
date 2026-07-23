@@ -5,37 +5,70 @@ https://deno.com
 """
 type Deno {
   """
-  Deno version used for the default base image. Defaults to a release that
-  supports config-file permission sets (`deno test -P`, added in 2.5.0). Older
-  overrides still work: `test` falls back to `-A` (grant all) below 2.5.0.
+  Override the container Deno commands run in — an exact pin
+  (`docker.io/denoland/deno:alpine-2.9.3`) or your own image (it must have `deno`
+  on PATH, or pass it through `install` first). Unset (the default) tracks the
+  latest published denoland/deno:alpine, re-resolved at most once a week. Read the
+  resolved container through `toolchain`, not here.
   """
-  pub version: String! = "2.9.3"
+  pub base: Container = null
 
   """
-  Base container for Deno commands. Defaults to denoland/deno:alpine-<version>
-  with the DENO_DIR cache configured. Override to bring your own image — it must
-  have `deno` on PATH, or pass it through `install` first.
+  The container every verb builds on: the `base` override when set, otherwise the
+  latest Deno image with our defaults layered on. A computed field, not a `base`
+  default, because the `Deno.latestImage` self call must run when the field is
+  read — a self call in a `=` default hangs (it re-enters module construction).
+  Self calls address the type (`Deno.…`), never the `deno` constructor.
   """
-  pub base: Container! =
-    container
-      .from("denoland/deno:alpine-" + version)
+  pub toolchain: Container! {
+    base ?? Deno.latestImage
       .withoutEntrypoint
       .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
+  }
+
+  """
+  The latest published Deno image, pinned for a week. `denoland/deno:alpine` is a
+  mutable tag; `@cache(ttl:)` holds the resolved digest for the TTL, so the whole
+  workspace builds against one Deno release for a week before it rolls forward.
+  Kept a bare pull so its cache key is only "the latest alpine image"; `toolchain`
+  layers our tweaks on top. 168h == the engine's max function-cache TTL.
+  """
+  @cache(ttl: "168h")
+  pub latestImage: Container! {
+    container.from("denoland/deno:alpine")
+  }
+
+  """
+  The `deno` binary from the latest published denoland/deno:bin image, cached for
+  a week like `latestImage`.
+  """
+  @cache(ttl: "168h")
+  pub latestBinary: File! {
+    container.from("denoland/deno:bin").file("/deno")
+  }
 
   """
   Install the Deno CLI and DENO_DIR cache into a container and return it. Copies
-  the `deno` binary from denoland/deno:bin-<version>; use it to add Deno to a
-  base that doesn't already have it (a glibc image such as debian, ubuntu, or
-  distroless/cc — the binary is glibc-linked, so for musl/alpine use the default
-  `base` instead).
+  the latest `deno` binary from denoland/deno:bin; use it to add Deno to a base
+  that doesn't already have it (a glibc image such as debian, ubuntu, or
+  distroless/cc — the binary is glibc-linked, so for musl/alpine use `toolchain`).
   """
   pub install(ctr: Container!): Container! {
-    let denoBin = container.from("denoland/deno:bin-" + version).file("/deno")
     ctr
       # 493 == 0o755; Dang has no octal literals.
-      .withFile("/usr/local/bin/deno", denoBin, permissions: 493)
+      .withFile("/usr/local/bin/deno", Deno.latestBinary, permissions: 493)
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
+  }
+
+  """
+  The Deno release the toolchain runs, e.g. "2.9.3". Derived from `toolchain`
+  (`deno --version`), so it stays correct whether `base` is overridden or tracking
+  the latest release.
+  """
+  pub version: String! {
+    let out = toolchain.withExec(["deno", "--version"]).stdout
+    (out.split("\n")[0] ?? "").split(" ")[1] ?? ""
   }
 
   """
@@ -55,8 +88,7 @@ type Deno {
     DenoProject(
       path: projectPath,
       workspaceRoot: findWorkspaceRoot(ws, projectPath) ?? projectPath,
-      base: base,
-      version: version,
+      base: toolchain,
     )
   }
 
@@ -77,7 +109,7 @@ type Deno {
     } else {
       path
     }
-    DenoWorkspace(path: root, base: base, version: version)
+    DenoWorkspace(path: root, base: toolchain)
   }
 
   """
@@ -87,7 +119,7 @@ type Deno {
   pub workspaces(ws: Workspace!): [DenoWorkspace!]! {
     configDirs(ws)
       .filter { dir => isWorkspaceRoot(ws, dir) }
-      .map { dir => DenoWorkspace(path: dir, base: base, version: version) }
+      .map { dir => DenoWorkspace(path: dir, base: toolchain) }
   }
 
   """
@@ -102,7 +134,7 @@ type Deno {
     dirs
       .filter { dir => roots.contains(dir) == false }
       .filter { dir => roots.any { root => underRoot(dir, root) } == false }
-      .map { dir => DenoProject(path: dir, workspaceRoot: dir, base: base, version: version) }
+      .map { dir => DenoProject(path: dir, workspaceRoot: dir, base: toolchain) }
   }
 
   """
