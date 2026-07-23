@@ -1,7 +1,12 @@
 # Design: drop the `version` setting, track the latest Deno release
 
-· Status: **proposed** — #13693 merged; self calls verified working on `main`
-with this repo's `dagger-module.toml` setup (see §3). Ready to implement. 
+· Status: **implemented** in this PR (`deno.dang`, `deno-project.dang`,
+`deno-workspace.dang`, e2e, `README.md`) and verified against `main` — all 15 e2e
+checks pass; `version` reports the latest release and a `base` override is
+honoured. The `deno.mdx` rewrite (§6) is a companion change for `dagger/dagger`.
+**Gated on engine:** self calls need [dagger/dagger#13693](https://github.com/dagger/dagger/pull/13693),
+which is on `main` but in no release yet — so `engineVersion` and the repo's CI
+engine must move to a release carrying it before merge. 
 · Supersedes: [#2](https://github.com/dagger/deno/pull/2) — *automatic Deno version bumps* (closed unmerged) 
 · Touches: `deno.dang`, `deno-project.dang`, `deno-workspace.dang`, `README.md`,
 and `docs/current_docs/modules/deno.mdx` in `dagger/dagger`
@@ -252,35 +257,53 @@ base = "docker.io/denoland/deno:alpine-2.9.3"
 
 ## 6. Work items
 
-**`dagger/deno`**
+**`dagger/deno`** — done in this PR
 
-- [ ] `deno.dang`: remove `pub version`; make `base` a nullable setting
-      (`Container = null`); add `toolchain` (`base ?? Deno.latestImage…`),
+- [x] `deno.dang`: removed `pub version`; `base` is a nullable setting
+      (`Container = null`); added `toolchain` (`base ?? Deno.latestImage…`),
       `latestImage` + `latestBinary` (`@cache(ttl: "168h")`, bare pulls);
-      `install` uses `Deno.latestBinary`; add read-only `version` off
-      `toolchain`; verbs and members build on `toolchain`. Self calls use the
-      **type name** `Deno.…`, never `deno.…`.
-- [ ] `deno-project.dang`, `deno-workspace.dang`: drop `version` / `numGte` /
-      `supportsPermissionSets`; take the resolved `toolchain` container in
-      place of `base`; `test` and `compile` always use `-P`.
-- [ ] `README.md`: drop `settings.version` (L52), the 2.5.0 fallback paragraph
-      (L152), `--version 2.9.3` (L216) and `deno(version: "2.9.3")` (L242);
-      reframe "reproducible toolchains" (L13) as *latest, refreshed weekly,
-      pinnable via `base`*.
-- [ ] e2e: cover `latestImage` resolving and `version` reporting a real
-      release; make sure nothing asserts a literal version string.
-- [ ] Bump `engineVersion` to a release that carries #13693.
+      `install` uses `Deno.latestBinary`; read-only `version` off `toolchain`;
+      verbs and members build on `toolchain`. Self calls use the **type name**
+      `Deno.…`.
+- [x] `deno-project.dang`, `deno-workspace.dang`: dropped `version` / `numGte` /
+      `supportsPermissionSets`; take the resolved `toolchain` container in place
+      of `base`; `test` and `compile` always use `-P`.
+- [x] `README.md`: dropped the `version` setting / 2.5.0 fallback / `--version`
+      example / `deno(version:)`; reframed the toolchain as latest-tracking,
+      pinnable via `base`; pointed the engine requirement at `--x-release=main`.
+- [x] e2e: replaced `legacyVersionCheck` with `versionCheck` (asserts a real 2.x
+      release + a working `latestImage`); nothing asserts a literal version.
 
-**`dagger/dagger`**
+- [ ] **Before merge:** bump `engineVersion` (`dagger-module.toml`,
+      `.dagger/modules/e2e`) and the repo CI engine to a release that carries
+      #13693. None exists yet — this is the merge gate.
 
-- [ ] `docs/current_docs/modules/deno.mdx`: remove the `version` bullet, the
-      `dagger settings deno version 2.9.3` snippet and the `version = "2.9.3"`
-      TOML, and the "`base` and `version` are mutually exclusive" line. Replace
-      with: the module tracks the latest Deno release and re-resolves it at most
-      weekly; set `base` to pin exactly; permissions still come from `deno.json`,
-      which requires Deno >= 2.5.0 if you override `base`. Update the closing
-      paragraph so `version` reads as *reports* the toolchain version, not
-      *configures* it.
+**`dagger/dagger`** — companion PR (not applied here; local checkout is on an
+unrelated branch)
+
+- [ ] `docs/current_docs/modules/deno.mdx`. Replace the whole "Configure it"
+      section with:
+
+      > ## Configure it
+      >
+      > By default the toolchain tracks the **latest** published Deno release,
+      > re-resolved at most once a week. No configuration is required. To pin an
+      > exact release, set `base` — with `dagger settings deno base <ref>`, or in
+      > `dagger.toml`:
+      >
+      > ```toml
+      > [modules.deno.settings]
+      > base = "docker.io/denoland/deno:alpine-2.9.3"
+      > ```
+      >
+      > Permissions still come from each project's `deno.json`; that needs Deno
+      > ≥ 2.5.0, so only override `base` with a 2.5.0+ image.
+
+      Drop the `version` bullet, the `dagger settings deno version 2.9.3` snippet,
+      the `version = "2.9.3"` TOML, and the "`base` and `version` are mutually
+      exclusive" line. In the closing paragraph, change "`version` prints the
+      configured toolchain version" to note `version` *reports* the toolchain's
+      Deno release and `toolchain` (not `base`) is the ready-to-use container.
 
 ## 7. Verified against `main` @ `1862b24f`
 
@@ -295,18 +318,21 @@ Tested with the **real deno module** (`dagger-module.toml`, `dang` runtime,
 3. **A `=` field default with a self call hangs on read.** The module loads, but
    reading that field never returns — so `base` cannot be a `= self-call` default;
    it has to be a plain setting resolved in `toolchain`.
-4. **A nullable `base: Container = null` is fully overridable.** With
-   `base = "docker.io/library/debian:latest"` under `[modules.<mod>.settings]`,
-   `toolchain` resolves the override (debian) instead of the default (alpine);
-   the `--base <ref>` constructor arg works too. (Settings only apply when the
-   module is invoked by its workspace name, e.g. `dagger call deno …` — not via
-   an ad-hoc `-m <path>` load.) So unset → latest, set → the pin.
+4. **A nullable `base: Container = null` is fully overridable.** `--base <ref>`
+   and `[modules.<mod>.settings] base = …` both flow through `toolchain`.
+   (Settings only apply when the module is invoked by its workspace name, e.g.
+   `dagger call deno …` — not via an ad-hoc `-m <path>` load.) So unset → latest,
+   set → the pin.
+5. **The implemented module passes end to end.** All **15 e2e checks** green on
+   `main`; `deno version` → `2.9.3` (parsed from the self-called toolchain);
+   `deno --base docker.io/denoland/deno:alpine-2.5.0 version` → `2.5.0` (override
+   honoured); `install` produces a working `deno` from `latestBinary`.
 
-Still to confirm before/while implementing:
+Still open (behaviour tuning, not blockers):
 
-5. **Is the TTL honoured across calls?** Confirm two calls a minute apart reuse
+6. **Is the TTL honoured across calls?** Confirm two calls a minute apart reuse
    one resolved digest, and the cached `Container` carries the pinned digest
    rather than re-resolving `denoland/deno:alpine` downstream.
-6. **`denoland/deno:alpine` and `:bin` are the right mutable tags** for "latest
+7. **`denoland/deno:alpine` and `:bin` are the right mutable tags** for "latest
    stable" (vs `:latest`, `:distroless`).
-7. **Is 7 days the right TTL,** or is 24h better given the per-engine caveat (§5)?
+8. **Is 7 days the right TTL,** or is 24h better given the per-engine caveat (§5)?
