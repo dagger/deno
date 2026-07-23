@@ -251,13 +251,20 @@ type E2e {
   }
 
   """
-  On a Deno older than 2.5.0 there is no `-P`, so `test` must fall back to `-A`
-  rather than send the unsupported flag. Running `test` with an overridden 2.4.0
-  toolchain passes only because of that fallback — sending `-P` would make deno
-  2.4.0 fail with "unexpected argument '-P'".
+  `version` reports the toolchain's Deno release (a real 2.x version parsed from
+  `deno --version`), and `latestImage` resolves to a working Deno container. Both
+  exercise the self call that backs the rolling default (no pinned version).
   """
-  pub legacyVersionCheck(ws: Workspace!): Void @check {
-    deno(version: "2.4.0").project(ws, helloPath).test(ws)
+  pub versionCheck(): Void @check {
+    let version = deno().version
+    assert(version.hasPrefix("2."), "version did not report a 2.x Deno release: " + version)
+
+    let fromImage = deno()
+      .latestImage
+      .withoutEntrypoint
+      .withExec(["deno", "--version"])
+      .stdout
+    assert(fromImage.contains("deno 2"), "latestImage is not a working Deno: " + fromImage)
     null
   }
 

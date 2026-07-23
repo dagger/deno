@@ -18,14 +18,10 @@ type DenoProject {
   pub workspaceRoot: String!
 
   """
-  Base container carrying the Deno toolchain, inherited from the Deno root.
+  Base container carrying the Deno toolchain, inherited from the Deno root
+  (its resolved `toolchain`).
   """
   let base: Container!
-
-  """
-  Deno version configured on the root, used to gate version-specific flags.
-  """
-  let version: String!
 
   """
   This project's deno.json / deno.jsonc file.
@@ -74,47 +70,16 @@ type DenoProject {
   }
 
   """
-  Numeric >= for two non-negative integer strings without leading zeros: the
-  longer one is larger, and equal lengths compare lexically (which matches
-  numeric order for same-width digits).
-  """
-  let numGte(a: String!, b: String!): Boolean! {
-    let da = a.split("").length
-    let db = b.split("").length
-    if (da != db) { da > db } else { a >= b }
-  }
-
-  """
-  Whether the configured Deno version supports config-file permission sets and
-  the `-P` flag (added in Deno 2.5.0). Compares the version's major.minor via
-  numGte (no numeric parsing needed).
-  """
-  let supportsPermissionSets(): Boolean! {
-    let parts = version.split(".")
-    let major = parts[0] ?? "0"
-    let minor = if (parts.length > 1) { parts[1] ?? "0" } else { "0" }
-    # >= 2.5.0: major >= 3, or major == 2 and minor >= 5.
-    if (numGte(major, "3")) {
-      true
-    } else if (major == "2") {
-      numGte(minor, "5")
-    } else {
-      false
-    }
-  }
-
-  """
-  Run this project's tests (`deno test`). On Deno >= 2.5.0 permissions are
-  governed entirely by the project's deno.json (`test.permissions`, or a
-  top-level set), activated with `-P` — there is no Dagger-side permission
-  argument. On older versions `-P` does not exist, so `test` falls back to `-A`
-  (grant all) instead of sending an unsupported flag.
+  Run this project's tests (`deno test`). Permissions are governed entirely by
+  the project's deno.json (`test.permissions`, or a top-level set), activated with
+  `-P` — there is no Dagger-side permission argument. The default toolchain always
+  supports `-P` (config permission sets landed in Deno 2.5.0); override `base` only
+  with a 2.5.0+ image.
   """
   pub test(ws: Workspace!): Void @check {
     # --permit-no-files: a project with no test files is a pass, not an error.
-    # -P applies deno.json's permission config (>= 2.5.0); older Deno gets -A.
-    let permissionFlag = if (supportsPermissionSets()) { "-P" } else { "-A" }
-    container(ws).withExec(["deno", "test", "--permit-no-files", permissionFlag]).sync
+    # -P applies deno.json's permission config.
+    container(ws).withExec(["deno", "test", "--permit-no-files", "-P"]).sync
     null
   }
 
@@ -150,9 +115,7 @@ type DenoProject {
 
   The binary's baked-in permissions come from the project's deno.json default
   permission set (top-level `permissions.default`) via `-P`, mirroring `test` —
-  there is no Dagger-side permission argument. On Deno older than 2.5.0 (no `-P`)
-  the binary is built with no baked permissions, rather than forcing `-A` (grant
-  all) into a shipped artifact.
+  there is no Dagger-side permission argument.
   """
   pub compile(
     ws: Workspace!,
@@ -161,10 +124,9 @@ type DenoProject {
     target: String = null,
   ): File! {
     let targetFlag = if (target == null) { [] } else { ["--target", target] }
-    let permissionFlag = if (supportsPermissionSets()) { ["-P"] } else { [] }
     let out = "/tmp/out/" + outputName
     container(ws)
-      .withExec(["deno", "compile"] + permissionFlag + ["--output", out] + targetFlag + [entrypoint])
+      .withExec(["deno", "compile", "-P", "--output", out] + targetFlag + [entrypoint])
       .file(out)
   }
 }

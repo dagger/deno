@@ -10,8 +10,10 @@ get:
 - **CI by design** — the very same checks run at your desk and in CI, in one
   pinned, consistent environment. `dagger check` locally is byte-for-byte what CI
   runs, so there is no separate pipeline to maintain and no "works on my machine".
-- **Reproducible toolchains** — a pinned Deno version and base image, the same
-  everywhere.
+- **Always-current toolchain, no maintenance** — the default tracks the latest
+  published Deno release, re-resolved at most once a week and held stable in
+  between, so every run in a given week shares one Deno build. Pin an exact
+  release by setting `base` when you need byte-for-byte reproducibility.
 - **Warm dependency cache** — `DENO_DIR` mounted as a Dagger cache volume, shared
   across every run.
 - **Reviewable formatting that can't go stale** — `deno fmt` comes back as a
@@ -30,15 +32,15 @@ See [`designs/deno-module.md`](./designs/deno-module.md) for the full design.
 
 ## Requirements
 
-This module targets a Dagger engine at **`v1.0.0-beta.6`**. In this repository the
-CLI is pinned with the `--x-release` flag (the default `dagger` on `PATH` is
-older); every command below can be run as:
+This module resolves its default toolchain with a Dang **self call**, which needs
+a Dagger engine that includes [dagger/dagger#13693](https://github.com/dagger/dagger/pull/13693).
+Until a release ships with it, run against `main`:
 
 ```sh
-dagger --x-release=v1.0.0-beta.6 <args…>
+dagger --x-release=main <args…>
 ```
 
-With a matching engine you can drop the flag.
+With a matching installed engine you can drop the flag.
 
 ## Quick start
 
@@ -48,8 +50,10 @@ With a matching engine you can drop the flag.
 dagger install github.com/dagger/deno
 ```
 
-This adds a `[modules.deno]` entry to your `dagger.toml`. Configure the toolchain
-there (or with `dagger settings`), e.g. `settings.version = "2.9.3"`.
+This adds a `[modules.deno]` entry to your `dagger.toml`. No configuration is
+needed — the toolchain tracks the latest Deno release. To pin an exact release,
+set `base` there (or with `dagger settings`), e.g.
+`settings.base = "docker.io/denoland/deno:alpine-2.9.3"`.
 
 **2. Run checks and generators** across everything in the workspace — every
 standalone `deno.json`/`deno.jsonc` *and* every Deno workspace (a `deno.json`
@@ -89,7 +93,7 @@ single `deno` command at the root, so the toolchain fans out across every member
 ```sh
 # run all members' checks at once (deno fans out from the root)
 dagger call deno workspace --path . lint
-dagger call deno workspace --path . test --allow-all
+dagger call deno workspace --path . test
 dagger call deno workspace --path . type-check
 
 # list the discovered members
@@ -149,8 +153,8 @@ dagger call deno project --path . test
 
 Keeping permissions in `deno.json` means the same policy applies locally
 (`deno test -P`), in CI, and here — there's one source of truth. This uses config
-permission sets, which landed in Deno **2.5.0**; if you override `version` to an
-older release, `test` falls back to `-A` (grant all) since `-P` doesn't exist yet.
+permission sets, which landed in Deno **2.5.0**. The default toolchain is always
+recent enough; only override `base` with a 2.5.0+ image.
 
 ### Format (`dagger generate`)
 
@@ -195,27 +199,29 @@ distinct from `test.permissions`):
 
 ### Toolchain container
 
-`base` is a ready-to-use container (Deno + cache). `install` adds the Deno CLI to
-a container you provide (a glibc base such as debian/ubuntu/distroless-cc; for
-musl/alpine use `base`).
+`toolchain` is the ready-to-use container (Deno + our defaults) every verb builds
+on. `install` adds the Deno CLI to a container you provide (a glibc base such as
+debian/ubuntu/distroless-cc; for musl/alpine use `toolchain`).
 
 ```sh
 # drop into a shell with deno available
-dagger call deno base terminal
+dagger call deno toolchain terminal
 
-# print the configured version
+# print the Deno release the toolchain runs
 dagger call deno version
 ```
 
 ### Configuration
 
-`version` and `base` are constructor arguments — set them before the function:
+By default the toolchain tracks the latest published `denoland/deno:alpine`,
+re-resolved at most once a week. Override `base` (a constructor argument, set
+before the function) to pin an exact release or bring your own image:
 
 ```sh
-# pin a specific Deno version
-dagger call deno --version 2.9.3 project --path . test
+# pin an exact Deno release
+dagger call deno --base docker.io/denoland/deno:alpine-2.9.3 project --path . test
 
-# bring your own base image
+# bring your own base image (must have deno on PATH, or run it through install)
 dagger call deno --base docker.io/denoland/deno:debian project --path . lint
 ```
 
@@ -239,7 +245,7 @@ value is: reuse the toolchain, add your own checks, ship images, and expose the
 type MyApp {
   """CI for this app: reuse Deno's checks, add our own."""
   pub ci(ws: Workspace!): Void @check {
-    let project = deno(version: "2.9.3").project(ws, ".")
+    let project = deno().project(ws, ".")
     project.lint(ws)
     project.typeCheck(ws)
     project.test(ws)
@@ -275,8 +281,8 @@ jsr dependency, and a Deno workspace with two members that import each other).
 
 ```sh
 # run the e2e checks
-dagger --x-release=v1.0.0-beta.6 -m .dagger/modules/e2e check
+dagger --x-release=main -m .dagger/modules/e2e check
 
 # or from the workspace root (also runs them)
-dagger --x-release=v1.0.0-beta.6 check
+dagger --x-release=main check
 ```
