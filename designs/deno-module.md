@@ -43,9 +43,9 @@ below, learned while building against a real engine:
   glibc-linked; for musl/alpine use the default `base`.
 - **`Workspace!` is auto-injected** as `currentWorkspace` (no `--ws` arg); the
   `ws`-passing model works transparently on the CLI and in `dagger check`.
-- **Discovery is relative to the caller's location** (shykes review): the reusable
-  `findConfigDirs(filenames, exclude)` helper from the `polyfill` module (per
-  [dagger/dagger#13688](https://github.com/dagger/dagger/issues/13688)) globs
+- **Discovery is relative to the caller's location** (shykes review): the native
+  `Workspace.findRoots(markers, exclude)` helper (per
+  [dagger/dagger#13854](https://github.com/dagger/dagger/pull/13854)) globs
   `**/deno.json(c)` from `.` (self + descendants) **and** find-ups the nearest
   enclosing project (as a `..`-relative path), all CWD-relative, excluding
   node_modules. See §7.
@@ -541,12 +541,11 @@ Unlike Go, a Deno project's source *is* its directory: there's no in-tree
 no include-graph discovery is required.
 
 **Discovery is relative to the caller's location, not the workspace root.**
-Discovery goes through one reusable, cwd-aware helper —
-`findConfigDirs(filenames, exclude)` — provided by the `polyfill` module
-(`polyfill().workspace(ws).findConfigDirs(...)`, see
-[dagger/dagger#13688](https://github.com/dagger/dagger/issues/13688)), so every
+Discovery goes through one cwd-aware engine primitive —
+`Workspace.findRoots(markers, exclude)` (see
+[dagger/dagger#13854](https://github.com/dagger/dagger/pull/13854)), so every
 module shares one implementation instead of reinventing it. `configDirs` is just
-`polyfill().workspace(ws).findConfigDirs(["deno.json", "deno.jsonc"], exclude: ["**/node_modules/**"])`.
+`ws.findRoots(markers: ["deno.json", "deno.jsonc"], exclude: ["**/node_modules/**"])`.
 Anchored at the caller's location, it runs two walks, both returning CWD-relative
 paths:
 
@@ -713,9 +712,9 @@ supplying the `@up` service the base module intentionally leaves to them.
 - [x] introspection: `config` / `source` / `container`
 - [x] multi-file layout (`deno.dang`, `deno-project.dang`)
 - [x] e2e tests (`.dagger/modules/e2e`) + `README.md`
-- [x] discovery relative to the caller's location, via the reusable
-      `findConfigDirs(filenames, exclude)` helper from the `polyfill` module
-      (dagger/dagger#13688): `projects(ws)` = self + descendants (glob from `.`) +
+- [x] discovery relative to the caller's location, via the native
+      `Workspace.findRoots(markers, exclude)` helper
+      (dagger/dagger#13854): `projects(ws)` = self + descendants (glob from `.`) +
       nearest enclosing ancestor (`ws.findUp`), all CWD-relative
 - [x] `*All` bulk verbs: `lintAll`/`testAll`/`typeCheckAll`/`formatCheckAll` + `formatAll`
       generator, scoped to the caller's cone (ancestors excluded)

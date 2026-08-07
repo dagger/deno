@@ -194,13 +194,12 @@ type Deno {
   Every directory in the workspace that holds a deno.json / deno.jsonc, anchored
   at the caller's location: its nearest enclosing project (find-up) plus every
   project at or below it (walk-down), excluding node_modules. Delegates to the
-  reusable, cwd-aware `findConfigDirs` from the `polyfill` module
-  (github.com/dagger/dagger#13688), which returns walk-down hits as CWD-relative
+  cwd-aware `Workspace.findRoots`, which returns walk-down hits as CWD-relative
   paths (".", "sub") and the find-up hit as a ".."-relative path ("..", "../..").
   """
   let configDirs(ws: Workspace!): [String!]! {
-    polyfill().workspace(ws).findConfigDirs(
-      ["deno.json", "deno.jsonc"],
+    ws.findRoots(
+      markers: ["deno.json", "deno.jsonc"],
       exclude: ["**/node_modules/**"],
     )
   }
