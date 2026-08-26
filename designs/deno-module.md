@@ -47,8 +47,9 @@ below, learned while building against a real engine:
   `Workspace.findRoots(markers, exclude)` helper (per
   [dagger/dagger#13854](https://github.com/dagger/dagger/pull/13854)) globs
   `**/deno.json(c)` from `.` (self + descendants) **and** find-ups the nearest
-  enclosing project (as a `..`-relative path), all CWD-relative, excluding
-  node_modules. See §7.
+  enclosing project (as a `..`-relative path), excluding node_modules. The hits
+  are then resolved to workspace-root-relative paths, the one spelling that
+  survives being read back from anywhere. See §7.
 - **Workspace-wide verbs shipped (v0.2 brought forward)** so the install DX works:
   `lintAll`/`testAll`/`typeCheckAll`/`formatCheckAll` (`@check`) and `formatAll`
   (`@generate`), run on the **caller's cone** (self + descendants, not ancestors).
@@ -557,18 +558,30 @@ paths:
   hit; that case is dropped (walk-down already covers the CWD and below), so
   find-up only ever yields a strict ancestor.
 
-So from `/sub` with `/deno.json` + `/sub/deno.json`, `configDirs` returns just `.`
+So from `/sub` with `/deno.json` + `/sub/deno.json`, `findRoots` returns just `.`
 (the CWD's own config shadows the ancestor); from `/sub` with only `/deno.json`,
 it returns `..` (the strict ancestor); from the root with `/deno.json` +
 `/sub/deno.json` it returns `.` and `sub`.
 
+**Discovery is anchored at the caller, but the paths handed back are relative to
+the workspace root.** Those are two different questions, and conflating them is
+what made every command fail outside the workspace root: `sub` read from `/sub`
+means `/sub/sub`. `configDirs` resolves each hit once, through
+`workspaceRootPath`, and every read is then a workspace-absolute
+`ws.directory("/" + dir)`. That is also what lets `findWorkspaceRoot` walk *above*
+the caller — from inside a member, the enclosing workspace root is an ancestor,
+and only a root-relative walk terminating at `.` can reach it.
+
+The one place the caller's location comes back is the **changeset** a generator
+hands back: the CLI applies it from where the caller stands, so `formatAll` keys
+its directories with `cwdRelative` rather than at the workspace root.
+
 The **workspace-wide verbs run on the cone only** — the caller's own project plus
 descendants, never the ancestors. A `@check` shouldn't reach up into a parent
 project you're nested inside, and a `Changeset` rooted at the caller's location
-can't represent changes *above* it (a `..` path collapses). The two walks label
-this for free: walk-down hits stay within the cwd (no `..`) while find-up hits are
-`..`-relative, so `projects`/`workspaces` list the ancestor for context but
-`lintAll` … `formatAll` filter to `inCone(dir) = !dir.hasPrefix("..")`.
+can't represent changes *above* it. So `projects`/`workspaces` list the ancestor
+for context but `lintAll` … `formatAll` filter to `inCone`, which keeps the
+directories sitting at or below `ws.cwd`.
 
 **`container` — mount the *workspace root*, set workdir to the member (v0.2):**
 

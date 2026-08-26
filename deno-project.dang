@@ -4,7 +4,8 @@ deno.json / deno.jsonc).
 """
 type DenoProject {
   """
-  Workspace-relative path of this project root.
+  Path of this project root, relative to the workspace root — so it stays valid
+  wherever the caller stands.
   """
   pub path: String!
 
@@ -31,7 +32,7 @@ type DenoProject {
   This project's deno.json / deno.jsonc file.
   """
   pub config(ws: Workspace!): File! {
-    let dir = ws.directory(path)
+    let dir = ws.directory("/" + path)
     if (dir.glob("deno.jsonc").length > 0) {
       dir.file("deno.jsonc")
     } else {
@@ -43,7 +44,7 @@ type DenoProject {
   This project's source directory (its subtree of the workspace).
   """
   pub source(ws: Workspace!): Directory! {
-    ws.directory(path, exclude: [".git", "**/node_modules"])
+    ws.directory("/" + path, exclude: [".git", "**/node_modules"])
   }
 
   """
@@ -61,7 +62,7 @@ type DenoProject {
     base
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
-      .withDirectory("/src", ws.directory(workspaceRoot, exclude: [".git", "**/node_modules"]))
+      .withDirectory("/src", ws.directory("/" + workspaceRoot, exclude: [".git", "**/node_modules"]))
       .withWorkdir(workdir)
   }
 
@@ -138,9 +139,13 @@ type DenoProject {
   Format the project (`deno fmt`); returns the diff for review before writing.
   """
   pub format(ws: Workspace!): Changeset! @generate {
-    let before = directory.withDirectory(path, source(ws))
+    # The CLI applies a changeset from where the caller stands, so key it there
+    # rather than at the workspace root.
+    let base = ws.cwd.trimPrefix("/").trimSuffix("/")
+    let dir = if (path == base) { "." } else { path.trimPrefix(base + "/") }
+    let before = directory.withDirectory(dir, source(ws))
     let formatted = container(ws).withExec(["deno", "fmt"]).directory(".")
-    let after = directory.withDirectory(path, formatted)
+    let after = directory.withDirectory(dir, formatted)
     after.changes(before)
   }
 

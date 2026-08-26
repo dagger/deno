@@ -155,6 +155,54 @@ type E2e {
   }
 
   """
+  Discovery is anchored at the caller's location, but the project roots it reports
+  stay relative to the workspace root, so they remain usable with every other
+  workspace API. Run from inside a member, the enclosing workspace root sits
+  *above* the caller — it has to survive being mounted, not just be spelled right,
+  since the cross-member `@ws/util` import only resolves from that root.
+  """
+  pub subdirDiscoveryCheck(): Void @check {
+    let member = directory
+      .withNewFile("deno.json", "{\n  \"workspace\": [\"./add\", \"./util\"]\n}\n")
+      .withNewFile("util/deno.json", "{\n  \"name\": \"@ws/util\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile("util/mod.ts", "export function tag(): string {\n  return \"util\";\n}\n")
+      .withNewFile("add/deno.json", "{\n  \"name\": \"@ws/add\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile(
+        "add/mod.ts",
+        "import { tag } from \"@ws/util\";\n\nexport function describe(n: number): string {\n  return `${tag()}:${n}`;\n}\n",
+      )
+      .withNewFile(
+        "add/mod_test.ts",
+        "import { describe } from \"./mod.ts\";\n\nDeno.test(\"describe uses the cross-member util package\", () => {\n  if (describe(3) !== \"util:3\") {\n    throw new Error(\"unexpected describe output\");\n  }\n});\n",
+      )
+      .withNewFile("add/dirty.ts", "export function f(a:number){return a}\n")
+      .asWorkspace(cwd: "add")
+
+    let project = deno().project(member, ".")
+    assert(project.path == "add", "lookup from a member directory returned: " + project.path)
+    assert(
+      project.workspaceRoot == ".",
+      "member did not resolve the workspace root above the caller: " + project.workspaceRoot,
+    )
+
+    # Only pass if the root above the caller is what gets mounted.
+    project.typeCheck(member)
+    project.test(member)
+
+    # The fan-out verbs reach the same member the same way, even though discovery
+    # never sees the workspace root from here.
+    deno().testAll(member)
+
+    # The CLI applies a generator's changeset from the caller's location, so the
+    # member sitting at the cwd is keyed there, not at the workspace root.
+    assert(
+      contains(deno().formatAll(member).modifiedPaths, "dirty.ts"),
+      "formatAll from a subdirectory did not key its changeset at the caller's location",
+    )
+    null
+  }
+
+  """
   All happy-path checks pass on a clean, well-formatted project.
   """
   pub cleanProjectCheck(ws: Workspace!): Void @check {

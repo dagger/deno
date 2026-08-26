@@ -50,7 +50,7 @@ type Deno {
     let projectPath = if (findUp) {
       findProjectRoot(ws, path)
     } else {
-      path
+      resolvePath(ws, path)
     }
     DenoProject(
       path: projectPath,
@@ -68,14 +68,14 @@ type Deno {
   """
   pub workspace(ws: Workspace!, path: String!, findUp: Boolean! = true): DenoWorkspace! {
     let root = if (findUp) {
-      let found = findWorkspaceRoot(ws, normalizePath(path))
+      let found = findWorkspaceRoot(ws, resolvePath(ws, path))
       if (found == null) {
         raise "no Deno workspace (deno.json with a `workspace` array) found containing path: " + path
       } else {
         found
       }
     } else {
-      path
+      resolvePath(ws, path)
     }
     DenoWorkspace(path: root, base: base, version: version)
   }
@@ -102,34 +102,43 @@ type Deno {
     dirs
       .filter { dir => roots.contains(dir) == false }
       .filter { dir => roots.any { root => underRoot(dir, root) } == false }
-      .map { dir => DenoProject(path: dir, workspaceRoot: dir, base: base, version: version) }
+      .map { dir =>
+        DenoProject(
+          path: dir,
+          # Discovery only sees an enclosing workspace root when it is itself in
+          # range; from inside a member the root sits above the caller, so resolve
+          # it by walking up rather than from `roots`.
+          workspaceRoot: findWorkspaceRoot(ws, dir) ?? dir,
+          base: base,
+          version: version,
+        )
+      }
   }
 
   """
   Whether a discovered directory is in the caller's cone (its own project plus
-  descendants), as opposed to an ancestor found by walking up. `configDirs`
-  returns walk-down hits as CWD-relative paths (the cone: ".", "sub") and the
-  find-up hit as a ".."-relative path (an ancestor: "..", "../.."), so an ancestor
-  is exactly a ".."-prefixed path. The workspace-wide verbs run on the cone only;
-  ancestors are listed by `projects` / `workspaces` but never checked or formatted
-  from here.
+  descendants), as opposed to an ancestor found by walking up — that is, whether
+  it sits at or below the caller's location. The workspace-wide verbs run on the
+  cone only; ancestors are listed by `projects` / `workspaces` but never checked
+  or formatted from here.
   """
-  let inCone(dir: String!): Boolean! {
-    dir.hasPrefix("..") == false
+  let inCone(ws: Workspace!, dir: String!): Boolean! {
+    let base = cwdPath(ws)
+    base == "." or dir == base or dir.hasPrefix(base + "/")
   }
 
   """
   The discovered workspaces in the caller's cone (excluding ancestors).
   """
   let coneWorkspaces(ws: Workspace!): [DenoWorkspace!]! {
-    workspaces(ws).filter { w => inCone(w.path) }
+    workspaces(ws).filter { w => inCone(ws, w.path) }
   }
 
   """
   The discovered standalone projects in the caller's cone (excluding ancestors).
   """
   let coneProjects(ws: Workspace!): [DenoProject!]! {
-    projects(ws).filter { p => inCone(p.path) }
+    projects(ws).filter { p => inCone(ws, p.path) }
   }
 
   """
@@ -179,13 +188,13 @@ type Deno {
     let wsRoots = coneWorkspaces(ws)
     let projs = coneProjects(ws)
     let before = projs.reduce(
-      wsRoots.reduce(directory) { acc, w => acc.withDirectory(w.path, w.source(ws)) }
-    ) { acc, p => acc.withDirectory(p.path, p.source(ws)) }
+      wsRoots.reduce(directory) { acc, w => acc.withDirectory(cwdRelative(ws, w.path), w.source(ws)) }
+    ) { acc, p => acc.withDirectory(cwdRelative(ws, p.path), p.source(ws)) }
     let afterWorkspaces = wsRoots.reduce(before) { acc, w =>
-      acc.withDirectory(w.path, w.container(ws).withExec(["deno", "fmt"]).directory("."))
+      acc.withDirectory(cwdRelative(ws, w.path), w.container(ws).withExec(["deno", "fmt"]).directory("."))
     }
     let after = projs.reduce(afterWorkspaces) { acc, p =>
-      acc.withDirectory(p.path, p.container(ws).withExec(["deno", "fmt"]).directory("."))
+      acc.withDirectory(cwdRelative(ws, p.path), p.container(ws).withExec(["deno", "fmt"]).directory("."))
     }
     after.changes(before)
   }
@@ -194,21 +203,73 @@ type Deno {
   Every directory in the workspace that holds a deno.json / deno.jsonc, anchored
   at the caller's location: its nearest enclosing project (find-up) plus every
   project at or below it (walk-down), excluding node_modules. Delegates to the
-  cwd-aware `Workspace.findRoots`, which returns walk-down hits as CWD-relative
-  paths (".", "sub") and the find-up hit as a ".."-relative path ("..", "../..").
+  cwd-aware `Workspace.findRoots`, which answers relative to the caller — walk-down
+  hits as ".", "sub" and the find-up hit as "..", "../..". Those are resolved to
+  workspace-root-relative paths, the one spelling that stays valid wherever the
+  caller stands.
   """
   let configDirs(ws: Workspace!): [String!]! {
-    ws.findRoots(
-      markers: ["deno.json", "deno.jsonc"],
-      exclude: ["**/node_modules/**"],
-    )
+    ws
+      .findRoots(
+        markers: ["deno.json", "deno.jsonc"],
+        exclude: ["**/node_modules/**"],
+      )
+      .map { dir => workspaceRootPath(ws, dir) }
+  }
+
+  """
+  Workspace-root-relative path of the caller's location.
+  """
+  let cwdPath(ws: Workspace!): String! {
+    normalizePath(ws.cwd)
+  }
+
+  """
+  Resolve a path expressed relative to the caller's location into a
+  workspace-root-relative one, collapsing any leading "..".
+  """
+  let workspaceRootPath(ws: Workspace!, cwdRelPath: String!): String! {
+    let segments = cwdRelPath.split("/").filter { s => s != "" and s != "." }
+    let up = segments.filter { s => s == ".." }.length
+    let down = segments.filter { s => s != ".." }
+    let resolved = ws.cwd.split("/").filter { s => s != "" }.dropLast(up) + down
+    if (resolved.length == 0) { "." } else { resolved.join("/") }
+  }
+
+  """
+  Resolve a caller-supplied path the way every other Dagger path argument
+  resolves: relative to the caller's location, or to the workspace root when
+  absolute.
+  """
+  let resolvePath(ws: Workspace!, path: String!): String! {
+    if (path.hasPrefix("/")) {
+      normalizePath(path)
+    } else {
+      workspaceRootPath(ws, path)
+    }
+  }
+
+  """
+  Re-express a cone path relative to the caller's location, for the changesets the
+  generators hand back — the CLI applies those from where the caller stands, not
+  from the workspace root.
+  """
+  let cwdRelative(ws: Workspace!, dir: String!): String! {
+    let base = cwdPath(ws)
+    if (dir == base) {
+      "."
+    } else if (base == ".") {
+      dir
+    } else {
+      dir.trimPrefix(base + "/")
+    }
   }
 
   """
   Contents of the deno.json / deno.jsonc at `dir`, or "" when neither exists.
   """
   let configText(ws: Workspace!, dir: String!): String! {
-    let d = ws.directory(dir)
+    let d = ws.directory("/" + dir)
     if (d.glob("deno.jsonc").length > 0) {
       d.file("deno.jsonc").contents
     } else if (d.glob("deno.json").length > 0) {
@@ -281,7 +342,9 @@ type Deno {
 
   """
   Resolve the project root (directory containing deno.json/deno.jsonc) that
-  contains `path`, walking up the workspace tree.
+  contains `path`, walking up the workspace tree. `path` is read the way the
+  engine reads any path argument (relative to the caller); `findUp` answers from
+  the workspace root, which is the spelling handed back.
   """
   let findProjectRoot(ws: Workspace!, path: String!): String! {
     let found = ws.findUp("deno.json", path) ?? ws.findUp("deno.jsonc", path)

@@ -7,8 +7,9 @@ members by hand.
 """
 type DenoWorkspace {
   """
-  Workspace-relative path of the workspace root (the directory holding the root
-  deno.json / deno.jsonc with the `workspace` array).
+  Path of the workspace root (the directory holding the root deno.json /
+  deno.jsonc with the `workspace` array), relative to the Dagger workspace root —
+  so it stays valid wherever the caller stands.
   """
   pub path: String!
 
@@ -26,7 +27,7 @@ type DenoWorkspace {
   The workspace's root deno.json / deno.jsonc file.
   """
   pub config(ws: Workspace!): File! {
-    let dir = ws.directory(path)
+    let dir = ws.directory("/" + path)
     if (dir.glob("deno.jsonc").length > 0) {
       dir.file("deno.jsonc")
     } else {
@@ -38,7 +39,7 @@ type DenoWorkspace {
   The workspace's source directory (its whole subtree of the outer workspace).
   """
   pub source(ws: Workspace!): Directory! {
-    ws.directory(path, exclude: [".git", "**/node_modules"])
+    ws.directory("/" + path, exclude: [".git", "**/node_modules"])
   }
 
   """
@@ -71,7 +72,7 @@ type DenoWorkspace {
   """
   pub members(ws: Workspace!): [DenoProject!]! {
     let src = ws.directory(
-      path,
+      "/" + path,
       include: ["**/deno.json", "**/deno.jsonc"],
       exclude: ["**/node_modules/**"],
     )
@@ -156,9 +157,13 @@ type DenoWorkspace {
   member, for review before writing.
   """
   pub format(ws: Workspace!): Changeset! @generate {
-    let before = directory.withDirectory(path, source(ws))
+    # The CLI applies a changeset from where the caller stands, so key it there
+    # rather than at the workspace root.
+    let base = ws.cwd.trimPrefix("/").trimSuffix("/")
+    let dir = if (path == base) { "." } else { path.trimPrefix(base + "/") }
+    let before = directory.withDirectory(dir, source(ws))
     let formatted = container(ws).withExec(["deno", "fmt"]).directory(".")
-    let after = directory.withDirectory(path, formatted)
+    let after = directory.withDirectory(dir, formatted)
     after.changes(before)
   }
 }
