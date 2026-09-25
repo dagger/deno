@@ -1,20 +1,17 @@
 """
-A Deno project rooted at a workspace-relative path (a directory containing a
-deno.json / deno.jsonc).
+A Deno project rooted at a workspace-relative path.
 """
 type DenoProject {
   """
-  Path of this project root, relative to the workspace root — so it stays valid
-  wherever the caller stands.
+  Project root, relative to the workspace.
   """
   path: String!
 
+  # For a member of a Deno workspace this is the directory holding the root
+  # deno.json whose `workspace` array lists this member. Commands run from there
+  # so the shared deno.lock, import map, and sibling members resolve.
   """
-  Workspace-relative path of the Deno workspace root this project belongs to.
-  Equals `path` for a standalone project; for a member of a Deno workspace it is
-  the directory holding the root deno.json (whose `workspace` array lists this
-  member). Commands run from the workspace root so the shared deno.lock, import
-  map, and sibling members resolve.
+  Root of the Deno workspace this project belongs to, or its own path.
   """
   workspaceRoot: String!
 
@@ -41,22 +38,20 @@ type DenoProject {
   }
 
   """
-  This project's source directory (its subtree of the workspace).
+  This project's source directory.
   """
   source(ws: Workspace!): Directory! {
     ws.directory("/" + path, exclude: [".git", "**/node_modules"])
   }
 
   """
-  Container with the Deno toolchain and the project mounted at the workdir. The
-  base every verb builds on, and the extension point for downstream modules.
-
-  For a standalone project the project subtree is mounted. For a workspace member
-  the whole workspace root is mounted and the workdir is set to the member's
-  subdirectory, so `deno` can walk up to the shared deno.lock, import map, and
-  sibling members while still scoping each command to this member.
+  Container with the Deno toolchain and this project at the workdir.
   """
   container(ws: Workspace!): Container! {
+    # A standalone project mounts its own subtree. A workspace member mounts the
+    # whole workspace root with the workdir at the member, so `deno` walks up to
+    # the shared deno.lock, import map, and sibling members while still scoping
+    # each command to this member.
     let rel = if (path == workspaceRoot) { "" } else {
       path.trimPrefix(workspaceRoot + "/")
     }
@@ -72,11 +67,127 @@ type DenoProject {
   }
 
   """
-  Lint this project (`deno lint`).
+  Lint this project with `deno lint`.
   """
   lint(ws: Workspace!): Void @check {
-    container(ws).withExec(["deno", "lint"]).sync
+    exec(ws, "lint").sync
     null
+  }
+
+  """
+  Run this project's tests with `deno test`.
+  """
+  test(ws: Workspace!): Void @check {
+    exec(ws, "test").sync
+    null
+  }
+
+  """
+  Type-check this project with `deno check`.
+  """
+  typeCheck(ws: Workspace!): Void @check {
+    exec(ws, "typeCheck").sync
+    null
+  }
+
+  """
+  Check this project's formatting with `deno fmt --check`.
+  """
+  formatCheck(ws: Workspace!): Void @check {
+    exec(ws, "formatCheck").sync
+    null
+  }
+
+  """
+  Format this project with `deno fmt`.
+  """
+  format(ws: Workspace!): Changeset! @generate {
+    scoped(ws, formatted(ws)).changes(scoped(ws, source(ws)))
+  }
+
+  """
+  Compile a standalone executable with `deno compile`.
+  """
+  compile(
+    ws: Workspace!,
+    entrypoint: String! = "main.ts",
+    outputName: String! = "app",
+    """
+    Target triple to cross-compile for, e.g. "x86_64-unknown-linux-gnu".
+    """
+    target: String = null,
+  ): File! {
+    # The binary's baked-in permissions come from deno.json's default permission
+    # set via `-P`, as for `test`. Below Deno 2.5.0 (no `-P`) it gets none, rather
+    # than forcing `-A` into a shipped artifact.
+    let targetFlag = if (target == null) { [] } else { ["--target", target] }
+    let permissionFlag = if (supportsPermissionSets) { ["-P"] } else { [] }
+    let out = "/tmp/out/" + outputName
+    container(ws)
+      .withExec(["deno", "compile"] + permissionFlag + ["--output", out] + targetFlag + [entrypoint])
+      .file(out)
+  }
+
+  """
+  The `deno` command line for one of the checks, by function name.
+  """
+  let args(command: String!): [String!]! {
+    if (command == "lint") {
+      ["deno", "lint"]
+    } else if (command == "test") {
+      # --permit-no-files: a project with no test files is a pass, not an error.
+      # -P applies deno.json's permission config (>= 2.5.0); older Deno has no
+      # -P, so it gets -A (grant all) instead.
+      let permissionFlag = if (supportsPermissionSets) { "-P" } else { "-A" }
+      ["deno", "test", "--permit-no-files", permissionFlag]
+    } else if (command == "typeCheck") {
+      ["deno", "check", "."]
+    } else if (command == "formatCheck") {
+      ["deno", "fmt", "--check"]
+    } else {
+      raise "unknown Deno command: " + command
+    }
+  }
+
+  let exec(ws: Workspace!, command: String!): Container! {
+    container(ws).withExec(args(command))
+  }
+
+  """
+  Error message from running one of the checks, or null when it passes.
+  """
+  let failure(ws: Workspace!, command: String!): String {
+    { exec(ws, command).sync; null } rescue {
+      err: Error => err.message
+    }
+  }
+
+  """
+  This project after `deno fmt`.
+  """
+  let formatted(ws: Workspace!): Directory! {
+    container(ws).withExec(["deno", "fmt"]).directory(".")
+  }
+
+  """
+  A tree of this project (its source, or its formatted output) as seen from the
+  caller: the CLI applies a changeset from where the caller stands, not from the
+  workspace root. From inside the project, only the part under the caller can be
+  represented, so that is what is kept.
+  """
+  let scoped(ws: Workspace!, tree: Directory!): Directory! {
+    let base = ws.cwd.trimPrefix("/").trimSuffix("/")
+    if (base == "" or base == ".") {
+      directory.withDirectory(path, tree)
+    } else if (path == base) {
+      tree
+    } else if (path.hasPrefix(base + "/")) {
+      directory.withDirectory(path.trimPrefix(base + "/"), tree)
+    } else if (path == ".") {
+      tree.directory(base)
+    } else {
+      tree.directory(base.trimPrefix(path + "/"))
+    }
   }
 
   """
@@ -107,74 +218,5 @@ type DenoProject {
     } else {
       false
     }
-  }
-
-  """
-  Run this project's tests (`deno test`). On Deno >= 2.5.0 permissions are
-  governed entirely by the project's deno.json (`test.permissions`, or a
-  top-level set), activated with `-P` — there is no Dagger-side permission
-  argument. On older versions `-P` does not exist, so `test` falls back to `-A`
-  (grant all) instead of sending an unsupported flag.
-  """
-  test(ws: Workspace!): Void @check {
-    # --permit-no-files: a project with no test files is a pass, not an error.
-    # -P applies deno.json's permission config (>= 2.5.0); older Deno gets -A.
-    let permissionFlag = if (supportsPermissionSets) { "-P" } else { "-A" }
-    container(ws).withExec(["deno", "test", "--permit-no-files", permissionFlag]).sync
-    null
-  }
-
-  """
-  Type-check the project without running it (`deno check`).
-  """
-  typeCheck(ws: Workspace!): Void @check {
-    container(ws).withExec(["deno", "check", "."]).sync
-    null
-  }
-
-  """
-  Check formatting without writing (`deno fmt --check`).
-  """
-  formatCheck(ws: Workspace!): Void @check {
-    container(ws).withExec(["deno", "fmt", "--check"]).sync
-    null
-  }
-
-  """
-  Format the project (`deno fmt`); returns the diff for review before writing.
-  """
-  format(ws: Workspace!): Changeset! @generate {
-    # The CLI applies a changeset from where the caller stands, so key it there
-    # rather than at the workspace root.
-    let base = ws.cwd.trimPrefix("/").trimSuffix("/")
-    let dir = if (path == base) { "." } else { path.trimPrefix(base + "/") }
-    let before = directory.withDirectory(dir, source(ws))
-    let formatted = container(ws).withExec(["deno", "fmt"]).directory(".")
-    let after = directory.withDirectory(dir, formatted)
-    after.changes(before)
-  }
-
-  """
-  Compile a standalone executable (`deno compile`). `target` cross-compiles
-  (e.g. "x86_64-unknown-linux-gnu"); null uses the base image's platform.
-
-  The binary's baked-in permissions come from the project's deno.json default
-  permission set (top-level `permissions.default`) via `-P`, mirroring `test` —
-  there is no Dagger-side permission argument. On Deno older than 2.5.0 (no `-P`)
-  the binary is built with no baked permissions, rather than forcing `-A` (grant
-  all) into a shipped artifact.
-  """
-  compile(
-    ws: Workspace!,
-    entrypoint: String! = "main.ts",
-    outputName: String! = "app",
-    target: String = null,
-  ): File! {
-    let targetFlag = if (target == null) { [] } else { ["--target", target] }
-    let permissionFlag = if (supportsPermissionSets) { ["-P"] } else { [] }
-    let out = "/tmp/out/" + outputName
-    container(ws)
-      .withExec(["deno", "compile"] + permissionFlag + ["--output", out] + targetFlag + [entrypoint])
-      .file(out)
   }
 }

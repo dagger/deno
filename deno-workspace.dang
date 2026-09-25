@@ -1,15 +1,12 @@
+# The whole tree shares a single deno.lock and import map, and `deno` fans a
+# single command out across every member, so the checks here run one command at
+# the root instead of iterating members by hand.
 """
-A Deno workspace (monorepo): a directory whose deno.json / deno.jsonc declares a
-`workspace` array of members. The whole tree shares a single deno.lock and import
-map, and `deno` fans a single command out across every member — so the
-workspace-wide checks here run one command at the root instead of iterating
-members by hand.
+A Deno workspace: a deno.json whose `workspace` array lists member packages.
 """
 type DenoWorkspace {
   """
-  Path of the workspace root (the directory holding the root deno.json /
-  deno.jsonc with the `workspace` array), relative to the Dagger workspace root —
-  so it stays valid wherever the caller stands.
+  Workspace root, relative to the Dagger workspace.
   """
   path: String!
 
@@ -36,16 +33,14 @@ type DenoWorkspace {
   }
 
   """
-  The workspace's source directory (its whole subtree of the outer workspace).
+  The workspace's source directory, members included.
   """
   source(ws: Workspace!): Directory! {
     ws.directory("/" + path, exclude: [".git", "**/node_modules"])
   }
 
   """
-  Container with the Deno toolchain and the whole workspace mounted at the
-  workdir. Workspace-wide commands run here so `deno` fans out across every
-  member with the shared deno.lock and import map.
+  Container with the Deno toolchain and the whole workspace at the workdir.
   """
   container(ws: Workspace!): Container! {
     base
@@ -64,13 +59,14 @@ type DenoWorkspace {
   }
 
   """
-  The member projects discovered under this workspace: every directory below the
-  root that has its own deno.json / deno.jsonc. Each is a DenoProject that mounts
-  the workspace root, so single-member commands still resolve the shared lockfile
-  and sibling members. (The workspace-wide checks below use `deno`'s own
-  workspace resolution, so they honor the exact `workspace` array regardless.)
+  The member projects below this workspace root.
   """
   members(ws: Workspace!): [DenoProject!]! {
+    # Every directory below the root with its own deno.json / deno.jsonc. Each is
+    # a DenoProject that mounts the workspace root, so single-member commands
+    # still resolve the shared lockfile and sibling members. This stays a plain
+    # list rather than a collection: the workspace's own checks already cover
+    # every member, and a collection would run them all again.
     let src = ws.directory(
       "/" + path,
       include: ["**/deno.json", "**/deno.jsonc"],
@@ -88,6 +84,106 @@ type DenoWorkspace {
           version: version,
         )
       }
+  }
+
+  """
+  Lint every member of this workspace with `deno lint`.
+  """
+  lint(ws: Workspace!): Void @check {
+    exec(ws, "lint").sync
+    null
+  }
+
+  """
+  Run tests in every member of this workspace with `deno test`.
+  """
+  test(ws: Workspace!): Void @check {
+    exec(ws, "test").sync
+    null
+  }
+
+  """
+  Type-check every member of this workspace with `deno check`.
+  """
+  typeCheck(ws: Workspace!): Void @check {
+    exec(ws, "typeCheck").sync
+    null
+  }
+
+  """
+  Check formatting of every member of this workspace with `deno fmt --check`.
+  """
+  formatCheck(ws: Workspace!): Void @check {
+    exec(ws, "formatCheck").sync
+    null
+  }
+
+  """
+  Format every member of this workspace with `deno fmt`.
+  """
+  format(ws: Workspace!): Changeset! @generate {
+    scoped(ws, formatted(ws)).changes(scoped(ws, source(ws)))
+  }
+
+  """
+  The `deno` command line for one of the checks, by function name.
+  """
+  let args(command: String!): [String!]! {
+    if (command == "lint") {
+      ["deno", "lint"]
+    } else if (command == "test") {
+      # Permissions come from each member's deno.json via -P; below Deno 2.5.0
+      # (no -P) it falls back to -A.
+      let permissionFlag = if (supportsPermissionSets) { "-P" } else { "-A" }
+      ["deno", "test", "--permit-no-files", permissionFlag]
+    } else if (command == "typeCheck") {
+      ["deno", "check", "."]
+    } else if (command == "formatCheck") {
+      ["deno", "fmt", "--check"]
+    } else {
+      raise "unknown Deno command: " + command
+    }
+  }
+
+  let exec(ws: Workspace!, command: String!): Container! {
+    container(ws).withExec(args(command))
+  }
+
+  """
+  Error message from running one of the checks, or null when it passes.
+  """
+  let failure(ws: Workspace!, command: String!): String {
+    { exec(ws, command).sync; null } rescue {
+      err: Error => err.message
+    }
+  }
+
+  """
+  This workspace after `deno fmt`.
+  """
+  let formatted(ws: Workspace!): Directory! {
+    container(ws).withExec(["deno", "fmt"]).directory(".")
+  }
+
+  """
+  A tree of this workspace (its source, or its formatted output) as seen from the
+  caller: the CLI applies a changeset from where the caller stands, not from the
+  workspace root. From inside the workspace, only the part under the caller can be
+  represented, so that is what is kept.
+  """
+  let scoped(ws: Workspace!, tree: Directory!): Directory! {
+    let base = ws.cwd.trimPrefix("/").trimSuffix("/")
+    if (base == "" or base == ".") {
+      directory.withDirectory(path, tree)
+    } else if (path == base) {
+      tree
+    } else if (path.hasPrefix(base + "/")) {
+      directory.withDirectory(path.trimPrefix(base + "/"), tree)
+    } else if (path == ".") {
+      tree.directory(base)
+    } else {
+      tree.directory(base.trimPrefix(path + "/"))
+    }
   }
 
   """
@@ -115,55 +211,5 @@ type DenoWorkspace {
     } else {
       false
     }
-  }
-
-  """
-  Lint every member of the workspace (`deno lint`).
-  """
-  lint(ws: Workspace!): Void @check {
-    container(ws).withExec(["deno", "lint"]).sync
-    null
-  }
-
-  """
-  Test every member of the workspace (`deno test`). Permissions come from each
-  member's deno.json (`test.permissions`) via `-P`, not from arguments; below
-  Deno 2.5.0 (no `-P`) it falls back to `-A`.
-  """
-  test(ws: Workspace!): Void @check {
-    let permissionFlag = if (supportsPermissionSets) { "-P" } else { "-A" }
-    container(ws).withExec(["deno", "test", "--permit-no-files", permissionFlag]).sync
-    null
-  }
-
-  """
-  Type-check every member of the workspace (`deno check`).
-  """
-  typeCheck(ws: Workspace!): Void @check {
-    container(ws).withExec(["deno", "check", "."]).sync
-    null
-  }
-
-  """
-  Check formatting of every member without writing (`deno fmt --check`).
-  """
-  formatCheck(ws: Workspace!): Void @check {
-    container(ws).withExec(["deno", "fmt", "--check"]).sync
-    null
-  }
-
-  """
-  Format the whole workspace (`deno fmt`); returns one changeset covering every
-  member, for review before writing.
-  """
-  format(ws: Workspace!): Changeset! @generate {
-    # The CLI applies a changeset from where the caller stands, so key it there
-    # rather than at the workspace root.
-    let base = ws.cwd.trimPrefix("/").trimSuffix("/")
-    let dir = if (path == base) { "." } else { path.trimPrefix(base + "/") }
-    let before = directory.withDirectory(dir, source(ws))
-    let formatted = container(ws).withExec(["deno", "fmt"]).directory(".")
-    let after = directory.withDirectory(dir, formatted)
-    after.changes(before)
   }
 }
