@@ -72,6 +72,19 @@ type E2e {
       contains(projects, helloPath + "/nested") == false,
       "projects included a directory without a deno.json",
     )
+    # The same selection rules on the real (git) workspace: inside a project's
+    # subdirectory, at its root, and from a directory in no project.
+    let insideHello = deno.projects(ws.withWorkdir(helloPath + "/nested")).keys
+    assert(insideHello == [helloPath], "inside hello/nested: " + insideHello.join(", "))
+    let atHello = deno.projects(ws.withWorkdir(helloPath)).keys
+    assert(atHello == [helloPath], "at hello: " + atHello.join(", "))
+    let fromModules = deno.projects(ws.withWorkdir(modulesRoot)).keys
+    assert(fromModules == projects, "from the fixtures directory: " + fromModules.join(", "))
+    assert(
+      deno.workspaces(ws.withWorkdir(modulesRoot)).keys == [workspacePath],
+      "from the fixtures directory: missed the workspace fixture",
+    )
+
     let workspaces = deno.workspaces(ws).keys
     assert(
       workspaces == [workspacePath],
@@ -389,13 +402,12 @@ type E2e {
   }
 
   """
-  The batches run on the caller's cone (its own project + descendants), never on
-  ancestor projects reached by walking up: an ancestor is not a key, though
-  `project` still reaches it by path.
+  At a project root, only that project and the ones below it are keys: an
+  enclosing project is not, though `project` still reaches it by path.
   """
   subdirScopeCheck: Void @check {
-    # Ancestor is skipped: dirty root, clean sub. From `/sub` the root is an ancestor,
-    # so the batches ignore it and pass (sub is clean).
+    # Ancestor is skipped: dirty root, clean sub. From `/sub`, a project root, the
+    # enclosing root is not a key, so the batches pass (sub is clean).
     let dirtyAncestor = directory
       .withNewFile("deno.json", "{}\n")
       .withNewFile("mod.ts", "export function f(a:number){return a}\n")
@@ -415,8 +427,8 @@ type E2e {
       "from /sub: checks must skip the ancestor root, so a dirty ancestor does not fail them",
     )
 
-    # Cone is covered: clean root, dirty sub. From `/sub`, sub is the caller's own
-    # project, so the projects batch checks it and fails.
+    # Clean root, dirty sub. From `/sub`, sub is the caller's own project, so the
+    # projects batch checks it and fails.
     let dirtySub = directory
       .withNewFile("deno.json", "{}\n")
       .withNewFile("mod.ts", "export const ok = 1;\n")
@@ -430,42 +442,104 @@ type E2e {
   }
 
   """
-  A strict ancestor — a project the caller lives under, with no config at the CWD
-  itself — is found by find-up (as a ".."-relative path) yet stays out of the
-  cone, so it is not a key and the batches skip it. Complements `subdirScopeCheck`, whose
-  CWD holds its own config and thus shadows the ancestor before it is ever
-  discovered; here the CWD has no config, so the ancestor really is discovered and
-  must still be excluded.
+  Keys follow the caller's location. From inside a project's subdirectory the
+  enclosing project is selected, alongside any project below; at a project root
+  only it and the projects below are keys; from outside any project, only the
+  projects below. Complements `subdirScopeCheck`, whose CWD holds its own config.
   """
-  ancestorExcludedCheck: Void @check {
-    # Dirty ancestor, clean descendant. From `/work` (no config of its own) the root
-    # is a discovered strict ancestor and `work/pkg` is the cone, so a dirty ancestor
-    # must not fail the checks.
-    let dirtyAncestor = directory
-      .withNewFile("deno.json", "{}\n")
-      .withNewFile("mod.ts", "export function f(a:number){return a}\n")
-      .withNewFile("work/pkg/deno.json", "{}\n")
-      .withNewFile("work/pkg/mod.ts", "export const ok = 1;\n")
-    let fromWork = dirtyAncestor.asWorkspace(cwd: "work")
+  cwdSelectionCheck: Void @check {
+    let tree = directory
+      .withNewFile("app/deno.json", "{}\n")
+      .withNewFile("app/mod.ts", "export function f(a:number){return a}\n")
+      .withNewFile("app/src/lib/x.ts", "export function g(b:number){return b}\n")
+      .withNewFile("other/deno.json", "{}\n")
+      .withNewFile("other/mod.ts", "export const ok = 1;\n")
+      .withNewFile("tools/scripts/run.sh", "echo hi\n")
+
+    # At a project root: that project, no siblings.
+    let atRoot = deno.projects(tree.asWorkspace(cwd: "app")).keys
+    assert(atRoot == ["app"], "at a project root: " + atRoot.join(", "))
+
+    # Inside a project's subdirectory: exactly the enclosing project.
+    let inside = tree.asWorkspace(cwd: "app/src")
+    let insideKeys = deno.projects(inside).keys
+    assert(insideKeys == ["app"], "inside a project's subdirectory: " + insideKeys.join(", "))
+    assert(deno.workspaces(inside).keys.length == 0, "inside a standalone project: found a Deno workspace")
+
+    # Its checks run on the whole project, so the dirty mod.ts above the caller
+    # fails them...
     assert(
-      deno.projects(fromWork).keys == ["work/pkg"],
-      "from /work: only the descendant should be a key: " + deno.projects(fromWork).keys.join(", "),
+      { formatCheckEverything(inside); false } rescue true,
+      "inside a project's subdirectory: its checks did not run on the enclosing project",
+    )
+    # ...but a changeset applies from where the caller stands, so format keeps
+    # only the part of the project under it.
+    let changes = deno.projects(inside).batch.format(inside)
+    assert(
+      changes.modifiedPaths == ["lib/x.ts"],
+      "format from inside a project did not scope its changeset to the caller: "
+        + changes.modifiedPaths.join(", "),
     )
     assert(
-      { formatCheckEverything(fromWork); true } rescue false,
-      "from /work: a discovered but out-of-cone ancestor must not fail the checks",
+      deno.project(inside, ".").format(inside).modifiedPaths == ["lib/x.ts"],
+      "project format from inside a project did not scope its changeset to the caller",
     )
 
-    # Clean ancestor, dirty descendant: the descendant is in the cone, so it fails.
-    let dirtyDescendant = directory
+    # Outside any project: the projects below, and none from a directory with none.
+    let outside = deno.projects(tree.asWorkspace).keys
+    assert(outside == ["app", "other"], "outside any project: " + outside.join(", "))
+    let empty = deno.projects(tree.asWorkspace(cwd: "tools")).keys
+    assert(empty.length == 0, "from a directory with no project: " + empty.join(", "))
+
+    # From a subdirectory of a project that has a project below it, both are keys.
+    let nested = directory
       .withNewFile("deno.json", "{}\n")
       .withNewFile("mod.ts", "export const ok = 1;\n")
       .withNewFile("work/pkg/deno.json", "{}\n")
-      .withNewFile("work/pkg/mod.ts", "export function f(a:number){return a}\n")
+      .withNewFile("work/pkg/mod.ts", "export const ok = 1;\n")
+      .asWorkspace(cwd: "work")
+    let nestedKeys = deno.projects(nested).keys
+    assert(nestedKeys == [".", "work/pkg"], "enclosing plus nested project: " + nestedKeys.join(", "))
+    null
+  }
+
+  """
+  Inside a Deno workspace member's subdirectory the member project is selected,
+  not the whole workspace: the member is the nearest enclosing project, and its
+  commands still mount the workspace root for the shared lockfile and siblings.
+  From a workspace subdirectory that belongs to no member, the workspace itself
+  is selected.
+  """
+  memberSelectionCheck: Void @check {
+    let tree = directory
+      .withNewFile("ws/deno.json", "{\n  \"workspace\": [\"./add\", \"./util\"]\n}\n")
+      .withNewFile("ws/util/deno.json", "{\n  \"name\": \"@ws/util\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile("ws/util/mod.ts", "export function tag(): string {\n  return \"util\";\n}\n")
+      .withNewFile("ws/add/deno.json", "{\n  \"name\": \"@ws/add\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile(
+        "ws/add/mod.ts",
+        "import { tag } from \"@ws/util\";\n\nexport function describe(n: number): string {\n  return `${tag()}:${n}`;\n}\n",
+      )
+      .withNewFile("ws/add/src/extra.ts", "export const extra = 1;\n")
+      .withNewFile("ws/docs/README.md", "# docs\n")
+
+    let inMember = tree.asWorkspace(cwd: "ws/add/src")
+    let projects = deno.projects(inMember)
+    assert(projects.keys == ["ws/add"], "inside a member's subdirectory: " + projects.keys.join(", "))
     assert(
-      { formatCheckEverything(dirtyDescendant.asWorkspace(cwd: "work")); false } rescue true,
-      "from /work: a descendant in the cone must be checked, so a dirty one fails",
+      projects.get(key: "ws/add").workspaceRoot == "ws",
+      "member item did not resolve its workspace root: " + projects.get(key: "ws/add").workspaceRoot,
     )
+    assert(
+      deno.workspaces(inMember).keys.length == 0,
+      "inside a member's subdirectory: the whole workspace was selected too",
+    )
+    # Passes only if the workspace root above the caller is mounted.
+    run(projects.batch.typeCheck(inMember))
+
+    let inDocs = tree.asWorkspace(cwd: "ws/docs")
+    assert(deno.workspaces(inDocs).keys == ["ws"], "inside a workspace's non-member subdirectory")
+    assert(deno.projects(inDocs).keys.length == 0, "inside a workspace's non-member subdirectory: found projects")
     null
   }
 

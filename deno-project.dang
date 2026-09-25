@@ -102,10 +102,7 @@ type DenoProject {
   Format this project with `deno fmt`.
   """
   format(ws: Workspace!): Changeset! @generate {
-    let dir = cwdDir(ws)
-    let before = directory.withDirectory(dir, source(ws))
-    let after = directory.withDirectory(dir, formatted(ws))
-    after.changes(before)
+    scoped(ws, formatted(ws)).changes(scoped(ws, source(ws)))
   }
 
   """
@@ -173,17 +170,23 @@ type DenoProject {
   }
 
   """
-  This project's path relative to the caller: the CLI applies a changeset from
-  where the caller stands, not from the workspace root.
+  A tree of this project (its source, or its formatted output) as seen from the
+  caller: the CLI applies a changeset from where the caller stands, not from the
+  workspace root. From inside the project, only the part under the caller can be
+  represented, so that is what is kept.
   """
-  let cwdDir(ws: Workspace!): String! {
+  let scoped(ws: Workspace!, tree: Directory!): Directory! {
     let base = ws.cwd.trimPrefix("/").trimSuffix("/")
-    if (path == base) {
-      "."
-    } else if (base == "" or base == ".") {
-      path
+    if (base == "" or base == ".") {
+      directory.withDirectory(path, tree)
+    } else if (path == base) {
+      tree
+    } else if (path.hasPrefix(base + "/")) {
+      directory.withDirectory(path.trimPrefix(base + "/"), tree)
+    } else if (path == ".") {
+      tree.directory(base)
     } else {
-      path.trimPrefix(base + "/")
+      tree.directory(base.trimPrefix(path + "/"))
     }
   }
 

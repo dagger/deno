@@ -66,34 +66,36 @@ type Deno {
   }
 
   """
-  Deno workspaces at or below the working directory, keyed by workspace root.
+  Deno workspaces at or around the working directory, keyed by workspace root.
   """
   workspaces(ws: Workspace!): DenoWorkspaces! {
-    DenoWorkspaces(
-      paths: configDirs(ws).filter { dir => inCone(ws, dir) and isWorkspaceRoot(
-        ws,
-        dir,
-      ) },
-      tool: self,
-    )
+    DenoWorkspaces(paths: workspaceRoots(ws, configDirs(ws)), tool: self)
   }
 
   """
-  Standalone Deno projects at or below the working directory, keyed by project
+  Standalone Deno projects at or around the working directory, keyed by project
   root.
   """
   projects(ws: Workspace!): DenoProjects! {
     # A standalone project is neither a workspace root nor a member of one;
-    # those are reached through `workspaces`. An enclosing root found by walking
-    # up still excludes its members, even though it is not a key itself.
+    # those are reached through `workspaces`.
     let dirs = configDirs(ws)
-    let roots = dirs.filter { dir => isWorkspaceRoot(ws, dir) }
+    let roots = workspaceRoots(ws, dirs)
+    let top = enclosingConfigDir(ws, dirs)
     DenoProjects(
       paths: dirs
-        .filter { dir => inCone(ws, dir) }
         .filter { dir => roots.contains(dir) == false }
         .filter { dir => roots.any { root => underRoot(dir, root) } == false },
-      enclosingWorkspace: findWorkspaceRoot(ws, cwdPath(ws)),
+      # Every key is either outside a Deno workspace or a member of the one
+      # enclosing the topmost config dir: a root at or below that would have
+      # excluded it. Resolved once here, walking only the config files above.
+      enclosingWorkspace: if (top == null) {
+        null
+      } else if (top == "." or roots.contains(top)) {
+        null
+      } else {
+        findWorkspaceRoot(ws, parentDir(top))
+      },
       tool: self,
     )
   }
@@ -107,11 +109,8 @@ type Deno {
   }
 
   """
-  Whether a discovered directory is in the caller's cone (its own project plus
-  descendants), as opposed to an ancestor found by walking up — that is, whether
-  it sits at or below the caller's location. Only the cone is keyed, so checks
-  and generators never run on an ancestor; `project` / `workspace` still reach
-  one by path.
+  Whether a directory sits at or below the caller's location, as opposed to an
+  enclosing one found by walking up.
   """
   let inCone(ws: Workspace!, dir: String!): Boolean! {
     let base = cwdPath(ws)
@@ -119,9 +118,20 @@ type Deno {
   }
 
   """
+  The discovered config directory at or above the caller's location (the
+  project the caller stands in), or null when the caller is in no project.
+  """
+  let enclosingConfigDir(ws: Workspace!, dirs: [String!]!): String {
+    let base = cwdPath(ws)
+    let enclosing = dirs.filter { dir => dir == base or underRoot(base, dir) }
+    enclosing[0]
+  }
+
+  """
   Every directory in the workspace that holds a deno.json / deno.jsonc, anchored
-  at the caller's location: its nearest enclosing project (find-up) plus every
-  project at or below it (walk-down), excluding node_modules. Delegates to the
+  at the caller's location: every project at or below it (walk-down), plus the
+  nearest enclosing project when the caller's location is not itself a project
+  root (find-up), excluding node_modules. Delegates to the
   cwd-aware `Workspace.findRoots`, which answers relative to the caller — walk-down
   hits as ".", "sub" and the find-up hit as "..", "../..". Those are resolved to
   workspace-root-relative paths, the one spelling that stays valid wherever the
@@ -169,34 +179,92 @@ type Deno {
   }
 
   """
-  Contents of the deno.json / deno.jsonc at `dir`, or "" when neither exists.
+  The discovered directories that are Deno workspace roots, in discovery order.
+  One ripgrep pass over the caller's subtree finds the configs mentioning
+  `workspace` (only those few are read); the enclosing directory found by
+  walking up, if any, is checked on its own.
   """
-  let configText(ws: Workspace!, dir: String!): String! {
-    let d = ws.directory("/" + dir)
-    if (d.glob("deno.jsonc").length > 0) {
-      d.file("deno.jsonc").contents
-    } else if (d.glob("deno.json").length > 0) {
-      d.file("deno.json").contents
-    } else {
-      ""
+  let workspaceRoots(ws: Workspace!, dirs: [String!]!): [String!]! {
+    let below = ws
+      .search(
+        pattern: "\"workspace\"",
+        literal: true,
+        filesOnly: true,
+        # Search paths are workspace-root-relative, unlike most Workspace paths.
+        paths: [cwdPath(ws)],
+        globs: ["deno.json", "deno.jsonc", "!**/node_modules", "!**/.git"],
+      ).{{filePath}}
+      .map { r => r.filePath.trimPrefix("/").trimPrefix("./") }
+      .filter { file => isWorkspaceConfig(ws, file) }
+      .map { file => configDirOf(file) }
+    dirs.filter { dir =>
+      if (inCone(ws, dir)) { below.contains(dir) } else { isWorkspaceRoot(ws, dir) }
     }
   }
 
   """
-  Whether the deno.json / deno.jsonc at `dir` declares a non-empty `workspace`
+  Whether the config file at a workspace-relative path declares a non-empty
+  `workspace` array.
+  """
+  let isWorkspaceConfig(ws: Workspace!, file: String!): Boolean! {
+    declaresWorkspace(ws.file("/" + file.trimPrefix("/")).contents)
+  }
+
+  """
+  Whether deno.json / deno.jsonc text declares a non-empty `workspace` array.
+  """
+  let declaresWorkspace(text: String!): Boolean! {
+    # deno.jsonc with comments/trailing commas isn't strict JSON; fall back
+    # to a presence check on the `workspace` key.
+    {
+      let cfg: DenoConfig! = JSON.decode(text)
+      cfg.workspace.length > 0
+    } rescue text.contains("\"workspace\"")
+  }
+
+  """
+  Directory holding a workspace-relative config file path.
+  """
+  let configDirOf(file: String!): String! {
+    let p = file.trimPrefix("/")
+    if (p == "deno.json" or p == "deno.jsonc") {
+      "."
+    } else {
+      p.trimSuffix("/deno.jsonc").trimSuffix("/deno.json")
+    }
+  }
+
+  """
+  The nearest deno.json / deno.jsonc at or above `dir` (workspace-relative), or
+  null. Two findUp calls, so no directory is listed or read.
+  """
+  let configFileAt(ws: Workspace!, dir: String!): String {
+    let from = if (dir == ".") { "/" } else { "/" + dir }
+    let json = ws.findUp("deno.json", from)
+    let jsonc = ws.findUp("deno.jsonc", from)
+    if (json == null) {
+      jsonc
+    } else if (jsonc == null) {
+      json
+    } else {
+      # Both exist somewhere above: the deeper one is nearer. In the same
+      # directory deno.jsonc wins, as it does for deno itself.
+      let jsonDir = configDirOf(json)
+      let jsoncDir = configDirOf(jsonc)
+      if (jsoncDir == jsonDir or underRoot(jsoncDir, jsonDir)) { jsonc } else { json }
+    }
+  }
+
+  """
+  Whether `dir` holds a deno.json / deno.jsonc declaring a non-empty `workspace`
   array (i.e. `dir` is a Deno workspace root).
   """
   let isWorkspaceRoot(ws: Workspace!, dir: String!): Boolean! {
-    let text = configText(ws, dir)
-    if (text == "") {
+    let file = configFileAt(ws, dir)
+    if (file == null) {
       false
     } else {
-      {
-        let cfg: DenoConfig! = JSON.decode(text)
-        cfg.workspace.length > 0
-      } rescue text.contains("\"workspace\"")
-      # deno.jsonc with comments/trailing commas isn't strict JSON; fall back
-      # to a presence check on the `workspace` key.
+      configDirOf(file) == dir and isWorkspaceConfig(ws, file)
     }
   }
 
@@ -229,35 +297,36 @@ type Deno {
 
   """
   Nearest ancestor-or-self of `dir` that is a Deno workspace root, or null when
-  `dir` belongs to no workspace.
+  `dir` belongs to no workspace. Hops between config files with findUp, so it
+  reads one file per enclosing project rather than one per directory.
   """
   let findWorkspaceRoot(ws: Workspace!, dir: String!): String {
-    if (isWorkspaceRoot(ws, dir)) {
-      dir
-    } else if (dir == ".") {
+    let file = configFileAt(ws, dir)
+    if (file == null) {
       null
     } else {
-      findWorkspaceRoot(ws, parentDir(dir))
+      let cfgDir = configDirOf(file)
+      if (isWorkspaceConfig(ws, file)) {
+        cfgDir
+      } else if (cfgDir == ".") {
+        null
+      } else {
+        findWorkspaceRoot(ws, parentDir(cfgDir))
+      }
     }
   }
 
   """
   Resolve the project root (directory containing deno.json/deno.jsonc) that
   contains `path`, walking up the workspace tree. `path` is read the way the
-  engine reads any path argument (relative to the caller); `findUp` answers from
-  the workspace root, which is the spelling handed back.
+  engine reads any path argument (relative to the caller).
   """
   let findProjectRoot(ws: Workspace!, path: String!): String! {
-    let found = ws.findUp("deno.json", path) ?? ws.findUp("deno.jsonc", path)
+    let found = configFileAt(ws, resolvePath(ws, path))
     if (found == null) {
       raise "no Deno project (deno.json/deno.jsonc) found containing path: " + path
     } else {
-      let p = found.trimPrefix("/")
-      if (p == "deno.json" or p == "deno.jsonc") {
-        "."
-      } else {
-        p.trimSuffix("/deno.json").trimSuffix("/deno.jsonc")
-      }
+      configDirOf(found)
     }
   }
 }
@@ -271,10 +340,8 @@ type DenoProjects @collection {
   """
   paths: [String!]! @keys
 
-  # The Deno workspace root at or above the caller, if any. Every key is either
-  # outside a workspace or a member of this one (a root inside the cone would
-  # have excluded it), so it is held here instead of the Workspace, which would
-  # stop the collection caching.
+  # The Deno workspace root enclosing the keys, if any (see `Deno.projects`).
+  # Held instead of the Workspace, which would stop the collection caching.
   let enclosingWorkspace: String
 
   let tool: Deno!
@@ -319,14 +386,12 @@ type DenoProjects @collection {
   """
   format(ws: Workspace!): Changeset! @generate {
     let items = paths.map { p => project(p) }
-    let before = items.reduce(directory) { acc, p => acc.withDirectory(
-      p.cwdDir(ws),
-      p.source(ws),
-    ) }
-    let after = items.reduce(before) { acc, p => acc.withDirectory(
-      p.cwdDir(ws),
-      p.formatted(ws),
-    ) }
+    let before = items.reduce(directory) { acc, p =>
+      acc.withDirectory(".", p.scoped(ws, p.source(ws)))
+    }
+    let after = items.reduce(before) { acc, p =>
+      acc.withDirectory(".", p.scoped(ws, p.formatted(ws)))
+    }
     after.changes(before)
   }
 
@@ -398,14 +463,12 @@ type DenoWorkspaces @collection {
   """
   format(ws: Workspace!): Changeset! @generate {
     let items = paths.map { p => workspace(p) }
-    let before = items.reduce(directory) { acc, w => acc.withDirectory(
-      w.cwdDir(ws),
-      w.source(ws),
-    ) }
-    let after = items.reduce(before) { acc, w => acc.withDirectory(
-      w.cwdDir(ws),
-      w.formatted(ws),
-    ) }
+    let before = items.reduce(directory) { acc, w =>
+      acc.withDirectory(".", w.scoped(ws, w.source(ws)))
+    }
+    let after = items.reduce(before) { acc, w =>
+      acc.withDirectory(".", w.scoped(ws, w.formatted(ws)))
+    }
     after.changes(before)
   }
 
