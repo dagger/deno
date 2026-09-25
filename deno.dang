@@ -1,20 +1,16 @@
 """
-A Dagger module for Deno — a secure runtime for JavaScript and TypeScript.
+Lint, test, type-check and format Deno projects and workspaces.
 
 https://deno.com
 """
 type Deno {
   """
-  Deno version used for the default base image. Defaults to a release that
-  supports config-file permission sets (`deno test -P`, added in 2.5.0). Older
-  overrides still work: `test` falls back to `-A` (grant all) below 2.5.0.
+  Deno version for the default base image.
   """
   version: String! = "2.9.3"
 
   """
-  Base container for Deno commands. Defaults to denoland/deno:alpine-<version>
-  with the DENO_DIR cache configured. Override to bring your own image — it must
-  have `deno` on PATH, or pass it through `install` first.
+  Base container for Deno commands. Must have `deno` on PATH.
   """
   base: Container! =
     container
@@ -23,13 +19,11 @@ type Deno {
       .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
 
   """
-  Install the Deno CLI and DENO_DIR cache into a container and return it. Copies
-  the `deno` binary from denoland/deno:bin-<version>; use it to add Deno to a
-  base that doesn't already have it (a glibc image such as debian, ubuntu, or
-  distroless/cc — the binary is glibc-linked, so for musl/alpine use the default
-  `base` instead).
+  Install the Deno CLI and cache into a glibc-based container.
   """
   install(ctr: Container!): Container! {
+    # The denoland/deno:bin binary is glibc-linked, so for musl/alpine use the
+    # default `base` instead.
     let denoBin = container.from("denoland/deno:bin-" + version).file("/deno")
     ctr
       # 493 == 0o755; Dang has no octal literals.
@@ -39,32 +33,23 @@ type Deno {
   }
 
   """
-  The Deno project containing `path`. With findUp (default) `path` may be any
-  directory inside a project and snaps to its root (the nearest deno.json /
-  deno.jsonc); set findUp: false when `path` is already a project root.
-
-  If the project is a member of a Deno workspace, its workspace root is resolved
-  so commands run with the shared deno.lock, import map, and sibling members.
+  The Deno project containing a workspace path.
   """
   project(ws: Workspace!, path: String!, findUp: Boolean! = true): DenoProject! {
+    # With findUp, `path` may be any directory inside a project and snaps to its
+    # root (the nearest deno.json / deno.jsonc). A member of a Deno workspace
+    # resolves its workspace root, so commands run with the shared deno.lock,
+    # import map, and sibling members.
     let projectPath = if (findUp) {
       findProjectRoot(ws, path)
     } else {
       resolvePath(ws, path)
     }
-    DenoProject(
-      path: projectPath,
-      workspaceRoot: findWorkspaceRoot(ws, projectPath) ?? projectPath,
-      base: base,
-      version: version,
-    )
+    projectAt(projectPath, findWorkspaceRoot(ws, projectPath) ?? projectPath)
   }
 
   """
-  The Deno workspace containing `path` (a directory whose deno.json declares a
-  `workspace` array). With findUp (default) `path` may be any directory inside
-  the workspace and snaps up to the root; set findUp: false when `path` is
-  already the workspace root.
+  The Deno workspace containing a workspace path.
   """
   workspace(ws: Workspace!, path: String!, findUp: Boolean! = true): DenoWorkspace! {
     let root = if (findUp) {
@@ -77,129 +62,60 @@ type Deno {
     } else {
       resolvePath(ws, path)
     }
-    DenoWorkspace(path: root, base: base, version: version)
+    workspaceAt(root)
   }
 
   """
-  Every Deno workspace discovered: each directory whose deno.json / deno.jsonc
-  declares a `workspace` array (excluding node_modules).
+  Deno workspaces at or below the working directory, keyed by workspace root.
   """
-  workspaces(ws: Workspace!): [DenoWorkspace!]! {
-    configDirs(ws)
-      .filter { dir => isWorkspaceRoot(ws, dir) }
-      .map { dir => DenoWorkspace(path: dir, base: base, version: version) }
+  workspaces(ws: Workspace!): DenoWorkspaces! {
+    DenoWorkspaces(
+      paths: configDirs(ws).filter { dir => inCone(ws, dir) and isWorkspaceRoot(
+        ws,
+        dir,
+      ) },
+      tool: self,
+    )
   }
 
   """
-  Every standalone Deno project discovered: each directory with a deno.json /
-  deno.jsonc that is neither a workspace root nor a member of one (those are
-  reached through `workspaces` / a workspace's `members`). node_modules is
-  excluded.
+  Standalone Deno projects at or below the working directory, keyed by project
+  root.
   """
-  projects(ws: Workspace!): [DenoProject!]! {
+  projects(ws: Workspace!): DenoProjects! {
+    # A standalone project is neither a workspace root nor a member of one;
+    # those are reached through `workspaces`. An enclosing root found by walking
+    # up still excludes its members, even though it is not a key itself.
     let dirs = configDirs(ws)
     let roots = dirs.filter { dir => isWorkspaceRoot(ws, dir) }
-    dirs
-      .filter { dir => roots.contains(dir) == false }
-      .filter { dir => roots.any { root => underRoot(dir, root) } == false }
-      .map { dir =>
-        DenoProject(
-          path: dir,
-          # Discovery only sees an enclosing workspace root when it is itself in
-          # range; from inside a member the root sits above the caller, so resolve
-          # it by walking up rather than from `roots`.
-          workspaceRoot: findWorkspaceRoot(ws, dir) ?? dir,
-          base: base,
-          version: version,
-        )
-      }
+    DenoProjects(
+      paths: dirs
+        .filter { dir => inCone(ws, dir) }
+        .filter { dir => roots.contains(dir) == false }
+        .filter { dir => roots.any { root => underRoot(dir, root) } == false },
+      enclosingWorkspace: findWorkspaceRoot(ws, cwdPath(ws)),
+      tool: self,
+    )
+  }
+
+  let projectAt(path: String!, workspaceRoot: String!): DenoProject! {
+    DenoProject(path: path, workspaceRoot: workspaceRoot, base: base, version: version)
+  }
+
+  let workspaceAt(path: String!): DenoWorkspace! {
+    DenoWorkspace(path: path, base: base, version: version)
   }
 
   """
   Whether a discovered directory is in the caller's cone (its own project plus
   descendants), as opposed to an ancestor found by walking up — that is, whether
-  it sits at or below the caller's location. The workspace-wide verbs run on the
-  cone only; ancestors are listed by `projects` / `workspaces` but never checked
-  or formatted from here.
+  it sits at or below the caller's location. Only the cone is keyed, so checks
+  and generators never run on an ancestor; `project` / `workspace` still reach
+  one by path.
   """
   let inCone(ws: Workspace!, dir: String!): Boolean! {
     let base = cwdPath(ws)
     base == "." or dir == base or dir.hasPrefix(base + "/")
-  }
-
-  """
-  The discovered workspaces in the caller's cone (excluding ancestors).
-  """
-  let coneWorkspaces(ws: Workspace!): [DenoWorkspace!]! {
-    workspaces(ws).filter { w => inCone(ws, w.path) }
-  }
-
-  """
-  The discovered standalone projects in the caller's cone (excluding ancestors).
-  """
-  let coneProjects(ws: Workspace!): [DenoProject!]! {
-    projects(ws).filter { p => inCone(ws, p.path) }
-  }
-
-  """
-  Lint every workspace and standalone project in the caller's cone (`deno lint`).
-  """
-  lintAll(ws: Workspace!): Void @check {
-    coneWorkspaces(ws).each { w => w.lint(ws) }
-    coneProjects(ws).each { p => p.lint(ws) }
-    null
-  }
-
-  """
-  Test every workspace and standalone project in the caller's cone (`deno test`).
-  """
-  testAll(ws: Workspace!): Void @check {
-    coneWorkspaces(ws).each { w => w.test(ws) }
-    coneProjects(ws).each { p => p.test(ws) }
-    null
-  }
-
-  """
-  Type-check every workspace and standalone project in the caller's cone
-  (`deno check`).
-  """
-  typeCheckAll(ws: Workspace!): Void @check {
-    coneWorkspaces(ws).each { w => w.typeCheck(ws) }
-    coneProjects(ws).each { p => p.typeCheck(ws) }
-    null
-  }
-
-  """
-  Check formatting of every workspace and standalone project in the caller's cone
-  (`deno fmt --check`).
-  """
-  formatCheckAll(ws: Workspace!): Void @check {
-    coneWorkspaces(ws).each { w => w.formatCheck(ws) }
-    coneProjects(ws).each { p => p.formatCheck(ws) }
-    null
-  }
-
-  """
-  Format every workspace and standalone project in the caller's cone (`deno fmt`);
-  returns one changeset. Ancestor projects are excluded — a changeset rooted at
-  the caller's location can't represent changes above it.
-  """
-  formatAll(ws: Workspace!): Changeset! @generate {
-    let wsRoots = coneWorkspaces(ws)
-    let projs = coneProjects(ws)
-    let before = projs.reduce(
-      wsRoots.reduce(directory) { acc, w => acc.withDirectory(
-        cwdRelative(ws, w.path),
-        w.source(ws),
-      ) },
-    ) { acc, p => acc.withDirectory(cwdRelative(ws, p.path), p.source(ws)) }
-    let afterWorkspaces = wsRoots.reduce(before) { acc, w =>
-      acc.withDirectory(cwdRelative(ws, w.path), w.container(ws).withExec(["deno", "fmt"]).directory("."))
-    }
-    let after = projs.reduce(afterWorkspaces) { acc, p =>
-      acc.withDirectory(cwdRelative(ws, p.path), p.container(ws).withExec(["deno", "fmt"]).directory("."))
-    }
-    after.changes(before)
   }
 
   """
@@ -249,22 +165,6 @@ type Deno {
       normalizePath(path)
     } else {
       workspaceRootPath(ws, path)
-    }
-  }
-
-  """
-  Re-express a cone path relative to the caller's location, for the changesets the
-  generators hand back — the CLI applies those from where the caller stands, not
-  from the workspace root.
-  """
-  let cwdRelative(ws: Workspace!, dir: String!): String! {
-    let base = cwdPath(ws)
-    if (dir == base) {
-      "."
-    } else if (base == ".") {
-      dir
-    } else {
-      dir.trimPrefix(base + "/")
     }
   }
 
@@ -359,6 +259,168 @@ type Deno {
         p.trimSuffix("/deno.json").trimSuffix("/deno.jsonc")
       }
     }
+  }
+}
+
+"""
+Standalone Deno projects in a workspace, keyed by project root.
+"""
+type DenoProjects @collection {
+  """
+  Project root paths.
+  """
+  paths: [String!]! @keys
+
+  # The Deno workspace root at or above the caller, if any. Every key is either
+  # outside a workspace or a member of this one (a root inside the cone would
+  # have excluded it), so it is held here instead of the Workspace, which would
+  # stop the collection caching.
+  let enclosingWorkspace: String
+
+  let tool: Deno!
+
+  """
+  The Deno project rooted at path.
+  """
+  project(path: String!): DenoProject! @get {
+    tool.projectAt(path, enclosingWorkspace ?? path)
+  }
+
+  """
+  Lint the selected Deno projects.
+  """
+  lint(ws: Workspace!): Void @check {
+    runAll(ws, "lint")
+  }
+
+  """
+  Run tests in the selected Deno projects.
+  """
+  test(ws: Workspace!): Void @check {
+    runAll(ws, "test")
+  }
+
+  """
+  Type-check the selected Deno projects.
+  """
+  typeCheck(ws: Workspace!): Void @check {
+    runAll(ws, "typeCheck")
+  }
+
+  """
+  Check formatting of the selected Deno projects.
+  """
+  formatCheck(ws: Workspace!): Void @check {
+    runAll(ws, "formatCheck")
+  }
+
+  """
+  Format the selected Deno projects.
+  """
+  format(ws: Workspace!): Changeset! @generate {
+    let items = paths.map { p => project(p) }
+    let before = items.reduce(directory) { acc, p => acc.withDirectory(
+      p.cwdDir(ws),
+      p.source(ws),
+    ) }
+    let after = items.reduce(before) { acc, p => acc.withDirectory(
+      p.cwdDir(ws),
+      p.formatted(ws),
+    ) }
+    after.changes(before)
+  }
+
+  """
+  Run one command in every selected project, then report each failure by path.
+  """
+  let runAll(ws: Workspace!, command: String!): Void {
+    # A selection over a list evaluates its elements concurrently, so every
+    # project's command runs in parallel.
+    let failures = paths.map { p => project(p) }.{{path, failure(ws, command)}}
+      .filter { result => result.failure != null }
+    if (failures.length > 0) {
+      raise "Deno " + command + " failed:\n" + failures.map { result =>
+        "- " + result.path + ": " + (result.failure ?? "")
+      }.join("\n")
+    }
+    null
+  }
+}
+
+"""
+Deno workspaces in a workspace, keyed by workspace root.
+"""
+type DenoWorkspaces @collection {
+  """
+  Workspace root paths.
+  """
+  paths: [String!]! @keys
+
+  let tool: Deno!
+
+  """
+  The Deno workspace rooted at path.
+  """
+  workspace(path: String!): DenoWorkspace! @get {
+    tool.workspaceAt(path)
+  }
+
+  """
+  Lint the selected Deno workspaces.
+  """
+  lint(ws: Workspace!): Void @check {
+    runAll(ws, "lint")
+  }
+
+  """
+  Run tests in the selected Deno workspaces.
+  """
+  test(ws: Workspace!): Void @check {
+    runAll(ws, "test")
+  }
+
+  """
+  Type-check the selected Deno workspaces.
+  """
+  typeCheck(ws: Workspace!): Void @check {
+    runAll(ws, "typeCheck")
+  }
+
+  """
+  Check formatting of the selected Deno workspaces.
+  """
+  formatCheck(ws: Workspace!): Void @check {
+    runAll(ws, "formatCheck")
+  }
+
+  """
+  Format the selected Deno workspaces.
+  """
+  format(ws: Workspace!): Changeset! @generate {
+    let items = paths.map { p => workspace(p) }
+    let before = items.reduce(directory) { acc, w => acc.withDirectory(
+      w.cwdDir(ws),
+      w.source(ws),
+    ) }
+    let after = items.reduce(before) { acc, w => acc.withDirectory(
+      w.cwdDir(ws),
+      w.formatted(ws),
+    ) }
+    after.changes(before)
+  }
+
+  """
+  Run one command in every selected workspace, then report each failure by path.
+  """
+  let runAll(ws: Workspace!, command: String!): Void {
+    let failures = paths.map { p => workspace(p) }.{{path, failure(ws, command)}}
+      .filter { result => result.failure != null }
+    if (failures.length > 0) {
+      raise "Deno " + command + " failed:\n" + failures.map { result =>
+        "- " + result.path + ": " + (result.failure ?? "")
+      }.join("\n")
+    }
+    null
   }
 }
 

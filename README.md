@@ -23,6 +23,9 @@ get:
   (a root `deno.json` with a `workspace` array) is a first-class object: checks
   fan out across every member, and a single member's checks still resolve the
   shared lockfile, import map, and sibling packages.
+- **Selectable** — projects and workspaces are Dagger collections, so you can
+  list them and run checks on just the ones you name
+  (`--deno-project=apps/api`).
 - **Composability** — install Deno into any container, produce standalone
   binaries, and extend it from your own module.
 
@@ -30,15 +33,9 @@ See [`designs/deno-module.md`](./designs/deno-module.md) for the full design.
 
 ## Requirements
 
-This module targets a Dagger engine at **`v1.0.0-beta.6`**. In this repository the
-CLI is pinned with the `--x-release` flag (the default `dagger` on `PATH` is
-older); every command below can be run as:
-
-```sh
-dagger --x-release=v1.0.0-beta.6 <args…>
-```
-
-With a matching engine you can drop the flag.
+This module needs a Dagger engine at **`v1.0.0-beta.15`** or later, for
+collections. That version is not released yet, so for now run it on a dev
+engine build.
 
 ## Quick start
 
@@ -51,19 +48,34 @@ dagger install github.com/dagger/deno
 This adds a `[modules.deno]` entry to your `dagger.toml`. Configure the toolchain
 there (or with `dagger settings`), e.g. `settings.version = "2.9.3"`.
 
-**2. Run checks and generators** across everything in the workspace — every
-standalone `deno.json`/`deno.jsonc` *and* every Deno workspace (a `deno.json`
-`workspace` array), discovered automatically:
+**2. Run checks and generators** across everything at or below where you
+stand — every standalone `deno.json`/`deno.jsonc` *and* every Deno workspace (a
+`deno.json` `workspace` array), discovered automatically:
 
 ```sh
-dagger check      # deno:lint-all, test-all, type-check-all, format-check-all
-dagger generate   # deno:format-all — runs `deno fmt`, previews the diff, then writes (add -y to skip the prompt)
+dagger check      # lint, test, type-check and format-check on every project and workspace
+dagger generate   # format — runs `deno fmt`, previews the diff, then writes (add -y to skip the prompt)
 ```
 
 These are Dagger's first-class verbs, so the same commands run identically in CI
 — there is no separate pipeline to maintain. And because Dagger surfaces every
 generator as a check too, `dagger check` *also* fails when your formatting is out
-of date.
+of date (the `stale` check).
+
+Select what runs by project, workspace, or check name:
+
+```sh
+dagger list deno-projects                           # standalone projects, by path
+dagger list deno-workspaces                         # Deno workspaces, by root path
+dagger check -l --all                               # one line per project/workspace and check
+
+dagger check --deno-project=apps/api                # every check on one project
+dagger check --deno --test --deno-project=apps/api --deno-project=apps/web
+dagger check deno/projects/lint                     # one check on every project
+dagger check deno/workspaces/test --deno-workspace=.
+dagger generate --deno-project=apps/api             # format just that project
+dagger -W ./apps/api check                          # or scope by directory
+```
 
 **3. Or call a specific function** — to run one thing, or to target a single
 project. `--path` is the project root (`.` for a single-project repo) and may
@@ -89,7 +101,7 @@ single `deno` command at the root, so the toolchain fans out across every member
 ```sh
 # run all members' checks at once (deno fans out from the root)
 dagger call deno workspace --path . lint
-dagger call deno workspace --path . test --allow-all
+dagger call deno workspace --path . test
 dagger call deno workspace --path . type-check
 
 # list the discovered members
@@ -107,7 +119,9 @@ dagger call deno project --path packages/api workspace-root   # -> the workspace
 
 `dagger check` / `dagger generate` handle the mix automatically: each discovered
 workspace is checked (with `deno` fanning out) and each standalone project is
-checked on its own — members are never run twice.
+checked on its own — members are never run twice. A workspace's `members` is a
+plain list rather than a collection for that reason: its members are checked
+through the workspace, not one by one.
 
 ## Functions
 
@@ -115,16 +129,30 @@ checked on its own — members are never run twice.
 
 | Function | Runs |
 |---|---|
-| `project … lint` | `deno lint` |
-| `project … test` | `deno test` |
-| `project … type-check` | `deno check` |
-| `project … format-check` | `deno fmt --check` |
+| `lint` | `deno lint` |
+| `test` | `deno test` |
+| `type-check` | `deno check` |
+| `format-check` | `deno fmt --check` |
 
-The same four checks exist on `workspace …` (running across every member of a
-Deno workspace at once). And each has a workspace-wide counterpart on the root —
-`lint-all`, `test-all`, `type-check-all`, `format-check-all` — that runs it across
-every discovered workspace and standalone project. Those are what `dagger check`
-invokes.
+Each exists on a project (`project …`) and on a workspace (`workspace …`, running
+across every member at once).
+
+`projects` and `workspaces` on the root are collections, which is how
+`dagger check` finds them:
+
+| Collection | Keys | Dimension flag | Check addresses |
+|---|---|---|---|
+| `projects` | standalone project roots | `--deno-project=PATH` | `deno/projects/lint`, `…/test`, `…/type-check`, `…/format-check` |
+| `workspaces` | Deno workspace roots | `--deno-workspace=PATH` | `deno/workspaces/lint`, `…/test`, `…/type-check`, `…/format-check` |
+
+Keys are workspace-root-relative paths, and only cover the project or workspace
+you are in and the ones below it: a project found by walking up from a
+subdirectory is not a key, so its checks don't run from there. A standalone
+project is one that is neither a Deno workspace root nor a member of one.
+
+Each collection's batch runs its check on every selected item in parallel, then
+fails naming each item that failed. Its batch `format` returns one changeset
+over the selected items.
 
 Tests often need permissions. Those come from the **project's `deno.json`**, not
 from Dagger flags: `test` always runs `deno test -P`, which applies the config's
@@ -155,7 +183,8 @@ older release, `test` falls back to `-A` (grant all) since `-P` doesn't exist ye
 ### Format (`dagger generate`)
 
 `format` returns a **changeset**. Dagger prints the diff and asks before writing;
-add `-y` to apply it.
+add `-y` to apply it. `dagger generate` runs it on every selected project and
+workspace (`deno/projects/format`, `deno/workspaces/format`).
 
 ```sh
 # preview the diff
@@ -240,9 +269,20 @@ type MyApp {
   """CI for this app: reuse Deno's checks, add our own."""
   pub ci(ws: Workspace!): Void @check {
     let project = deno(version: "2.9.3").project(ws, ".")
-    project.lint(ws)
-    project.typeCheck(ws)
-    project.test(ws)
+    run(project.lint(ws))
+    run(project.typeCheck(ws))
+    run(project.test(ws))
+    # Or every standalone project at once, or just some of them:
+    run(deno.projects(ws).batch.test(ws))
+    run(deno.projects(ws).subset(keys: ["apps/api"]).batch.lint(ws))
+    null
+  }
+
+  """A check called through a dependency returns a Check; run it."""
+  let run(check: Check!): Void {
+    if (check.pass == false) {
+      raise check.error.message ?? "check failed"
+    }
     null
   }
 
@@ -265,8 +305,9 @@ type MyApp {
 
 ## Development
 
-The module is split into `deno.dang` (root `Deno` type), `deno-project.dang`
-(`DenoProject`), and `deno-workspace.dang` (`DenoWorkspace`).
+The module is split into `deno.dang` (root `Deno` type and the `DenoProjects` /
+`DenoWorkspaces` collections), `deno-project.dang` (`DenoProject`), and
+`deno-workspace.dang` (`DenoWorkspace`).
 
 End-to-end tests live in [`.dagger/modules/e2e`](./.dagger/modules/e2e): a Dang
 module that installs this module and drives it against the sample projects under
@@ -275,8 +316,8 @@ jsr dependency, and a Deno workspace with two members that import each other).
 
 ```sh
 # run the e2e checks
-dagger --x-release=v1.0.0-beta.6 -m .dagger/modules/e2e check
+dagger check -m .dagger/modules/e2e
 
 # or from the workspace root (also runs them)
-dagger --x-release=v1.0.0-beta.6 check
+dagger check
 ```
