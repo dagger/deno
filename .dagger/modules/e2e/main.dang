@@ -36,16 +36,14 @@ type E2e {
   discovery partitions the workspace fixture (a root + members) apart from the
   standalone projects.
   """
-  pub discoveryCheck(ws: Workspace!): Void @check {
-    let formatFailed = try {
-      deno().formatCheckAll(ws)
+  discoveryCheck(ws: Workspace!): Void @check {
+    let formatFailed = {
+      deno.formatCheckAll(ws)
       false
-    } catch {
-      err => true
-    }
+    } rescue true
     assert(formatFailed, "formatCheckAll did not fail; discovery missed the unformatted fixture")
 
-    let changes = deno().formatAll(ws)
+    let changes = deno.formatAll(ws)
     assert(
       contains(changes.modifiedPaths, fmtDirtyPath + "/main.ts"),
       "formatAll changeset did not include the discovered fmt-dirty project",
@@ -54,7 +52,7 @@ type E2e {
     # A standalone project (no workspace ancestor) resolves its workspace root to
     # itself, so it mounts only its own subtree.
     assert(
-      deno().project(ws, helloPath).workspaceRoot == helloPath,
+      deno.project(ws, helloPath).workspaceRoot == helloPath,
       "standalone project should resolve its workspace root to itself",
     )
     null
@@ -64,8 +62,8 @@ type E2e {
   A real Deno workspace: its root deno.json `workspace` array is discovered, the
   workspace-wide checks fan out across every member, and members are enumerated.
   """
-  pub workspaceCheck(ws: Workspace!): Void @check {
-    let workspace = deno().workspace(ws, workspacePath)
+  workspaceCheck(ws: Workspace!): Void @check {
+    let workspace = deno.workspace(ws, workspacePath)
     assert(workspace.path == workspacePath, "workspace lookup returned wrong path: " + workspace.path)
 
     workspace.lint(ws)
@@ -81,15 +79,15 @@ type E2e {
   test sees the shared config and the sibling `@ws/util` package. Mounting only
   the member subtree (the pre-workspace behavior) would fail this check.
   """
-  pub workspaceMemberCheck(ws: Workspace!): Void @check {
-    let add = deno().project(ws, workspacePath + "/add")
+  workspaceMemberCheck(ws: Workspace!): Void @check {
+    let add = deno.project(ws, workspacePath + "/add")
     assert(add.path == workspacePath + "/add", "member path wrong: " + add.path)
     assert(
       add.workspaceRoot == workspacePath,
       "member did not resolve its workspace root: " + add.workspaceRoot,
     )
     # The sibling `util` package is also a member of the same workspace root.
-    let util = deno().project(ws, workspacePath + "/util")
+    let util = deno.project(ws, workspacePath + "/util")
     assert(
       util.workspaceRoot == workspacePath,
       "sibling member did not resolve its workspace root: " + util.workspaceRoot,
@@ -111,7 +109,7 @@ type E2e {
   own subtree) and the cross-member `@ws/util` import would fail. Passing all three
   verbs proves both the fan-out and the partition hold.
   """
-  pub workspaceAllCheck(): Void @check {
+  workspaceAllCheck: Void @check {
     let sub = directory
       .withNewFile("deno.json", "{\n  \"workspace\": [\"./add\", \"./util\"]\n}\n")
       .withNewFile("util/deno.json", "{\n  \"name\": \"@ws/util\",\n  \"exports\": \"./mod.ts\"\n}\n")
@@ -125,10 +123,10 @@ type E2e {
         "add/mod_test.ts",
         "import { describe } from \"./mod.ts\";\n\nDeno.test(\"describe uses the cross-member util package\", () => {\n  if (describe(3) !== \"util:3\") {\n    throw new Error(\"unexpected describe output\");\n  }\n});\n",
       )
-      .asWorkspace()
-    deno().typeCheckAll(sub)
-    deno().testAll(sub)
-    deno().lintAll(sub)
+      .asWorkspace
+    deno.typeCheckAll(sub)
+    deno.testAll(sub)
+    deno.lintAll(sub)
     null
   }
 
@@ -138,13 +136,13 @@ type E2e {
   member's file. Uses a throwaway workspace so the clean on-disk fixture stays
   clean for the other checks.
   """
-  pub workspaceFormatCheck(): Void @check {
+  workspaceFormatCheck: Void @check {
     let dirty = directory
       .withNewFile("deno.json", "{\n  \"workspace\": [\"./pkg\"]\n}\n")
       .withNewFile("pkg/deno.json", "{\n  \"name\": \"@ws/pkg\",\n  \"exports\": \"./mod.ts\"\n}\n")
       .withNewFile("pkg/mod.ts", "export function f(a:number){return a}\n")
-    let wsDir = dirty.asWorkspace()
-    let changes = deno().workspace(wsDir, ".").format(wsDir)
+    let wsDir = dirty.asWorkspace
+    let changes = deno.workspace(wsDir, ".").format(wsDir)
 
     assert(changes.isEmpty == false, "workspace format produced no diff on a badly formatted member")
     assert(
@@ -161,7 +159,7 @@ type E2e {
   *above* the caller — it has to survive being mounted, not just be spelled right,
   since the cross-member `@ws/util` import only resolves from that root.
   """
-  pub subdirDiscoveryCheck(): Void @check {
+  subdirDiscoveryCheck: Void @check {
     let member = directory
       .withNewFile("deno.json", "{\n  \"workspace\": [\"./add\", \"./util\"]\n}\n")
       .withNewFile("util/deno.json", "{\n  \"name\": \"@ws/util\",\n  \"exports\": \"./mod.ts\"\n}\n")
@@ -178,7 +176,7 @@ type E2e {
       .withNewFile("add/dirty.ts", "export function f(a:number){return a}\n")
       .asWorkspace(cwd: "add")
 
-    let project = deno().project(member, ".")
+    let project = deno.project(member, ".")
     assert(project.path == "add", "lookup from a member directory returned: " + project.path)
     assert(
       project.workspaceRoot == ".",
@@ -191,12 +189,12 @@ type E2e {
 
     # The fan-out verbs reach the same member the same way, even though discovery
     # never sees the workspace root from here.
-    deno().testAll(member)
+    deno.testAll(member)
 
     # The CLI applies a generator's changeset from the caller's location, so the
     # member sitting at the cwd is keyed there, not at the workspace root.
     assert(
-      contains(deno().formatAll(member).modifiedPaths, "dirty.ts"),
+      contains(deno.formatAll(member).modifiedPaths, "dirty.ts"),
       "formatAll from a subdirectory did not key its changeset at the caller's location",
     )
     null
@@ -205,8 +203,8 @@ type E2e {
   """
   All happy-path checks pass on a clean, well-formatted project.
   """
-  pub cleanProjectCheck(ws: Workspace!): Void @check {
-    let project = deno().project(ws, helloPath)
+  cleanProjectCheck(ws: Workspace!): Void @check {
+    let project = deno.project(ws, helloPath)
     project.lint(ws)
     project.typeCheck(ws)
     project.formatCheck(ws)
@@ -218,9 +216,9 @@ type E2e {
   Project lookup snaps a nested path to the owning project root, and findUp:false
   keeps an exact root untouched.
   """
-  pub projectLookupCheck(ws: Workspace!): Void @check {
-    let nested = deno().project(ws, helloPath + "/nested")
-    let exact = deno().project(ws, helloPath, findUp: false)
+  projectLookupCheck(ws: Workspace!): Void @check {
+    let nested = deno.project(ws, helloPath + "/nested")
+    let exact = deno.project(ws, helloPath, findUp: false)
     assert(nested.path == helloPath, "find-up lookup returned wrong path: " + nested.path)
     assert(exact.path == helloPath, "exact lookup returned wrong path: " + exact.path)
     null
@@ -230,8 +228,8 @@ type E2e {
   format returns a non-empty changeset on a badly formatted project, touching
   only that project's files; formatCheck fails on the same project.
   """
-  pub dirtyProjectCheck(ws: Workspace!): Void @check {
-    let project = deno().project(ws, fmtDirtyPath)
+  dirtyProjectCheck(ws: Workspace!): Void @check {
+    let project = deno.project(ws, fmtDirtyPath)
     let changes = project.format(ws)
 
     assert(changes.isEmpty == false, "format produced no diff on a badly formatted project")
@@ -240,12 +238,10 @@ type E2e {
       "format diff did not modify the project's main.ts",
     )
 
-    let formatCheckFailed = try {
+    let formatCheckFailed = {
       project.formatCheck(ws)
       false
-    } catch {
-      err => true
-    }
+    } rescue true
     assert(formatCheckFailed, "formatCheck did not fail on a badly formatted project")
     null
   }
@@ -253,8 +249,8 @@ type E2e {
   """
   install adds a working Deno CLI to a bare glibc base image.
   """
-  pub installCheck(): Void @check {
-    let version = deno()
+  installCheck: Void @check {
+    let version = deno
       .install(container.from("debian:stable-slim"))
       .withExec(["deno", "--version"])
       .stdout
@@ -266,8 +262,8 @@ type E2e {
   A project with a jsr dependency type-checks and tests (exercises the dependency
   cache path).
   """
-  pub withDepsCheck(ws: Workspace!): Void @check {
-    let project = deno().project(ws, withDepsPath)
+  withDepsCheck(ws: Workspace!): Void @check {
+    let project = deno.project(ws, withDepsPath)
     project.typeCheck(ws)
     project.test(ws)
     null
@@ -279,18 +275,16 @@ type E2e {
   those permissions granted — and the same container without `-P` fails, proving
   the flag is what activates the config.
   """
-  pub permissionCheck(ws: Workspace!): Void @check {
-    let project = deno().project(ws, permNetPath)
+  permissionCheck(ws: Workspace!): Void @check {
+    let project = deno.project(ws, permNetPath)
     # The module runs `deno test -P`, so net (declared in deno.json) is granted.
     project.test(ws)
 
     # Without -P, deno refuses config permissions — proves -P is load-bearing.
-    let withoutPermissionFlagFailed = try {
+    let withoutPermissionFlagFailed = {
       project.container(ws).withExec(["deno", "test", "--permit-no-files"]).sync
       false
-    } catch {
-      err => true
-    }
+    } rescue true
     assert(
       withoutPermissionFlagFailed,
       "deno test without -P should fail when permissions live in deno.json",
@@ -304,7 +298,7 @@ type E2e {
   toolchain passes only because of that fallback — sending `-P` would make deno
   2.4.0 fail with "unexpected argument '-P'".
   """
-  pub legacyVersionCheck(ws: Workspace!): Void @check {
+  legacyVersionCheck(ws: Workspace!): Void @check {
     deno(version: "2.4.0").project(ws, helloPath).test(ws)
     null
   }
@@ -315,8 +309,8 @@ type E2e {
   with net, so the compiled binary reports net as granted when run — without `-P`
   it would report `prompt`.
   """
-  pub compilePermissionCheck(ws: Workspace!): Void @check {
-    let bin = deno().project(ws, permAppPath).compile(ws, entrypoint: "main.ts")
+  compilePermissionCheck(ws: Workspace!): Void @check {
+    let bin = deno.project(ws, permAppPath).compile(ws, entrypoint: "main.ts")
     let output = container
       .from("debian:stable-slim")
       .withFile("/app", bin, permissions: 493)
@@ -334,7 +328,7 @@ type E2e {
   never on ancestor projects reached by walking up — even though those ancestors are
   still listed by `projects`.
   """
-  pub subdirScopeCheck(): Void @check {
+  subdirScopeCheck: Void @check {
     # Ancestor is skipped: dirty root, clean sub. From `/sub` the root is an ancestor,
     # so formatCheckAll ignores it and passes (sub is clean).
     let dirtyAncestor = directory
@@ -343,7 +337,7 @@ type E2e {
       .withNewFile("sub/deno.json", "{}\n")
       .withNewFile("sub/mod.ts", "export const ok = 1;\n")
     assert(
-      try { deno().formatCheckAll(dirtyAncestor.asWorkspace(cwd: "sub")); true } catch { err => false },
+      { deno.formatCheckAll(dirtyAncestor.asWorkspace(cwd: "sub")); true } rescue false,
       "from /sub: checks must skip the ancestor root, so a dirty ancestor does not fail them",
     )
 
@@ -355,7 +349,7 @@ type E2e {
       .withNewFile("sub/deno.json", "{}\n")
       .withNewFile("sub/mod.ts", "export function f(a:number){return a}\n")
     assert(
-      try { deno().formatCheckAll(dirtySub.asWorkspace(cwd: "sub")); false } catch { err => true },
+      { deno.formatCheckAll(dirtySub.asWorkspace(cwd: "sub")); false } rescue true,
       "from /sub: checks must cover the caller's own project, so a dirty sub fails them",
     )
     null
@@ -369,7 +363,7 @@ type E2e {
   discovered; here the CWD has no config, so the ancestor really is discovered and
   must still be excluded.
   """
-  pub ancestorExcludedCheck(): Void @check {
+  ancestorExcludedCheck: Void @check {
     # Dirty ancestor, clean descendant. From `/work` (no config of its own) the root
     # is a discovered strict ancestor and `work/pkg` is the cone, so a dirty ancestor
     # must not fail the checks.
@@ -379,7 +373,7 @@ type E2e {
       .withNewFile("work/pkg/deno.json", "{}\n")
       .withNewFile("work/pkg/mod.ts", "export const ok = 1;\n")
     assert(
-      try { deno().formatCheckAll(dirtyAncestor.asWorkspace(cwd: "work")); true } catch { err => false },
+      { deno.formatCheckAll(dirtyAncestor.asWorkspace(cwd: "work")); true } rescue false,
       "from /work: a discovered but out-of-cone ancestor must not fail the checks",
     )
 
@@ -390,7 +384,7 @@ type E2e {
       .withNewFile("work/pkg/deno.json", "{}\n")
       .withNewFile("work/pkg/mod.ts", "export function f(a:number){return a}\n")
     assert(
-      try { deno().formatCheckAll(dirtyDescendant.asWorkspace(cwd: "work")); false } catch { err => true },
+      { deno.formatCheckAll(dirtyDescendant.asWorkspace(cwd: "work")); false } rescue true,
       "from /work: a descendant in the cone must be checked, so a dirty one fails",
     )
     null
