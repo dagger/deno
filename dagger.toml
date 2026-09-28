@@ -9,13 +9,18 @@ source = "github.com/dagger/dang-sdk"
 # Marker filename that skips generate when found at or above a Dang SDK module root.
 # settings.skipGenerateFilename = ""
 
-[modules.dagger-dang-sdk.as-sdk]
-name = "dang"
-
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "."
-
 # End-to-end tests: installs the deno module and drives it against the sample
 # projects under .dagger/modules/e2e/modules.
 [modules.e2e]
 source = ".dagger/modules/e2e"
+
+[sdks.dang]
+module = "dagger-dang-sdk"
+
+[sdks.dang.scopes."."]
+is-module = true
+name = "deno"
+
+[sdks.dang.scopes.".dagger/modules/e2e"]
+clients = ["./."]
+is-module = true

@@ -11,7 +11,7 @@ type DenoWorkspace {
   deno.jsonc with the `workspace` array), relative to the Dagger workspace root —
   so it stays valid wherever the caller stands.
   """
-  pub path: String!
+  path: String!
 
   """
   Base container carrying the Deno toolchain, inherited from the Deno root.
@@ -26,7 +26,7 @@ type DenoWorkspace {
   """
   The workspace's root deno.json / deno.jsonc file.
   """
-  pub config(ws: Workspace!): File! {
+  config(ws: Workspace!): File! {
     let dir = ws.directory("/" + path)
     if (dir.glob("deno.jsonc").length > 0) {
       dir.file("deno.jsonc")
@@ -38,7 +38,7 @@ type DenoWorkspace {
   """
   The workspace's source directory (its whole subtree of the outer workspace).
   """
-  pub source(ws: Workspace!): Directory! {
+  source(ws: Workspace!): Directory! {
     ws.directory("/" + path, exclude: [".git", "**/node_modules"])
   }
 
@@ -47,7 +47,7 @@ type DenoWorkspace {
   workdir. Workspace-wide commands run here so `deno` fans out across every
   member with the shared deno.lock and import map.
   """
-  pub container(ws: Workspace!): Container! {
+  container(ws: Workspace!): Container! {
     base
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
@@ -70,7 +70,7 @@ type DenoWorkspace {
   and sibling members. (The workspace-wide checks below use `deno`'s own
   workspace resolution, so they honor the exact `workspace` array regardless.)
   """
-  pub members(ws: Workspace!): [DenoProject!]! {
+  members(ws: Workspace!): [DenoProject!]! {
     let src = ws.directory(
       "/" + path,
       include: ["**/deno.json", "**/deno.jsonc"],
@@ -104,7 +104,7 @@ type DenoWorkspace {
   Whether the configured Deno version supports config-file permission sets and
   the `-P` flag (added in Deno 2.5.0). Compares the version's major.minor.
   """
-  let supportsPermissionSets(): Boolean! {
+  let supportsPermissionSets: Boolean! {
     let parts = version.split(".")
     let major = parts[0] ?? "0"
     let minor = if (parts.length > 1) { parts[1] ?? "0" } else { "0" }
@@ -120,7 +120,7 @@ type DenoWorkspace {
   """
   Lint every member of the workspace (`deno lint`).
   """
-  pub lint(ws: Workspace!): Void @check {
+  lint(ws: Workspace!): Void @check {
     container(ws).withExec(["deno", "lint"]).sync
     null
   }
@@ -130,8 +130,8 @@ type DenoWorkspace {
   member's deno.json (`test.permissions`) via `-P`, not from arguments; below
   Deno 2.5.0 (no `-P`) it falls back to `-A`.
   """
-  pub test(ws: Workspace!): Void @check {
-    let permissionFlag = if (supportsPermissionSets()) { "-P" } else { "-A" }
+  test(ws: Workspace!): Void @check {
+    let permissionFlag = if (supportsPermissionSets) { "-P" } else { "-A" }
     container(ws).withExec(["deno", "test", "--permit-no-files", permissionFlag]).sync
     null
   }
@@ -139,7 +139,7 @@ type DenoWorkspace {
   """
   Type-check every member of the workspace (`deno check`).
   """
-  pub typeCheck(ws: Workspace!): Void @check {
+  typeCheck(ws: Workspace!): Void @check {
     container(ws).withExec(["deno", "check", "."]).sync
     null
   }
@@ -147,7 +147,7 @@ type DenoWorkspace {
   """
   Check formatting of every member without writing (`deno fmt --check`).
   """
-  pub formatCheck(ws: Workspace!): Void @check {
+  formatCheck(ws: Workspace!): Void @check {
     container(ws).withExec(["deno", "fmt", "--check"]).sync
     null
   }
@@ -156,7 +156,7 @@ type DenoWorkspace {
   Format the whole workspace (`deno fmt`); returns one changeset covering every
   member, for review before writing.
   """
-  pub format(ws: Workspace!): Changeset! @generate {
+  format(ws: Workspace!): Changeset! @generate {
     # The CLI applies a changeset from where the caller stands, so key it there
     # rather than at the workspace root.
     let base = ws.cwd.trimPrefix("/").trimSuffix("/")
