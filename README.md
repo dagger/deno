@@ -33,9 +33,7 @@ See [`designs/deno-module.md`](./designs/deno-module.md) for the full design.
 
 ## Requirements
 
-This module needs a Dagger engine at **`v1.0.0-beta.15`** or later, for
-collections. That version is not released yet, so for now run it on a dev
-engine build.
+Requires Dagger **v1.0.0-beta.15** or later.
 
 ## Quick start
 
@@ -56,16 +54,24 @@ packages/ui/deno.json       member
 dagger install github.com/dagger/deno
 ```
 
-This adds a `[modules.deno]` entry to your `dagger.toml`. Its settings are the
-Deno toolchain:
+This adds a `[modules.deno]` entry to your `dagger.toml`. Its settings:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `version` | `2.9.3` | Deno version for the default base image (`denoland/deno:alpine-<version>`). |
+| `version` | `"2.9.3"` | Deno version for the default base image (`denoland/deno:alpine-<version>`). |
 | `base` | the image above | Base container for Deno commands; it must have `deno` on `PATH`. |
+| `permissions` | `"config"` | Permissions for `test` and `compile`: `"config"` (the deno.json permission sets, `-P`), `"all"` (`-A`) or `"none"`. See [Test permissions](#test-permissions). |
+| `testArgs` | `[]` | Extra `deno test` flags, e.g. `["--doc", "--parallel", "--ignore=_tools/"]`. |
+| `typeCheckArgs` | `[]` | Extra `deno check` flags, e.g. `["--allow-import"]`. |
+| `typeCheckTargets` | `["."]` | What `type-check` checks, relative to each project or workspace root, e.g. `["mod.ts"]`. |
+
+`dagger settings deno` lists them (its VALUE column shows only what you've
+set). Set one with `dagger settings deno <key> <value>`; list values are JSON:
 
 ```sh
 dagger settings deno version 2.9.3
+dagger settings deno permissions all
+dagger settings deno testArgs '["--doc"]'
 ```
 
 writes
@@ -73,14 +79,18 @@ writes
 ```toml
 [modules.deno.settings]
 version = "2.9.3"
+permissions = "all"
+testArgs = ["--doc"]
 ```
+
+The same settings apply to every project and workspace the module checks.
 
 **2. Run checks and generators.** Projects and workspaces are discovered from
 where you stand (see [Discovery](#discovery)):
 
 ```sh
 dagger check      # lint, test, type-check and format-check every project and workspace
-dagger generate   # format: runs `deno fmt`, previews the diff, then writes (add -y to skip the prompt)
+dagger generate -y   # format: runs `deno fmt` and writes the result
 ```
 
 These are Dagger's first-class verbs, so the same commands run identically in CI
@@ -96,7 +106,7 @@ dagger list deno-workspaces -a                      # Deno workspaces, by root p
 dagger check -l --all                               # one line per project/workspace and check
 
 dagger check --deno-project=apps/api                # every check on one project
-dagger check --deno --test --deno-project=apps/api --deno-project=apps/web
+dagger check --deno --check test --deno-project=apps/api --deno-project=apps/web
 dagger check deno/projects/lint                     # one check on every project
 dagger check deno/workspaces/test --deno-workspace=packages
 dagger generate -y --deno-project=apps/api          # format just that project
@@ -154,8 +164,10 @@ Each config directory then lands in exactly one collection:
 
 Inside a workspace **member** (`packages/ui/src`), the member is the nearest
 enclosing project, so the member is selected — not the whole workspace. Its
-commands still mount the workspace root, so the shared `deno.lock`, import map
-and sibling packages resolve; `dagger check` there checks just that member.
+commands run from the workspace root with the member as the target
+(`deno test ui`), as a workspace's own CI does, so the shared `deno.lock`,
+import map and sibling packages resolve and tests see the root as their cwd;
+`dagger check` there checks just that member.
 Inside a workspace directory that belongs to no member (`packages/docs`), the
 workspace itself is selected.
 
@@ -185,9 +197,12 @@ dagger call deno workspace --path packages type-check
 dagger call deno workspace --path packages members path
 ```
 
-To work on **one** member, use `project` with the member's path — the container
-mounts the whole workspace root (so the shared lockfile and sibling `@scope/pkg`
-imports resolve) and scopes the command to that member:
+To work on **one** member, use `project` with the member's path. Its checks run
+from the workspace root (so the shared lockfile and sibling `@scope/pkg` imports
+resolve) and pass the member's directory as the target — `deno lint ui`,
+`deno test ui`, `deno check ui`, `deno fmt --check ui` — so they cover that
+member only. Its `container` has the whole workspace mounted with the member as
+the workdir, for your own commands:
 
 ```sh
 dagger call deno project --path packages/ui test
@@ -232,12 +247,24 @@ Each collection's batch runs its check on every selected item in parallel, then
 fails naming each item that failed. Its batch `format` returns one changeset
 over the selected items.
 
-Tests often need permissions. Those come from the **project's `deno.json`**, not
-from Dagger flags: `test` always runs `deno test -P`, which applies the config's
-permission set. Declare what your tests need in `deno.json`:
+### Test permissions
+
+`test` runs `deno test --permit-no-files`, plus a permission flag chosen by the
+`permissions` setting:
+
+- **`"config"`** (default) runs `deno test -P`, which applies the permission set
+  in the project's `deno.json` (`test.permissions`, or a top-level set). The
+  same policy then applies locally (`deno test -P`), in CI and here. Deno prints
+  `Permissions in the config file is an experimental feature and may change in
+  the future.` with every run. A project without a permission set gets **no**
+  permissions this way, so its tests that need any fail with `NotCapable`.
+- **`"all"`** runs `deno test -A`. Use it when your CI grants permissions on the
+  command line (`deno test -A`, `--allow-read …`), as denoland/std and oak do.
+  Tests run in a container, so `-A` reaches the container, not your machine.
+- **`"none"`** passes no flag, so tests get no permissions at all.
 
 ```jsonc
-// deno.json
+// deno.json — for "config"
 {
   "test": {
     "permissions": {
@@ -249,24 +276,48 @@ permission set. Declare what your tests need in `deno.json`:
 ```
 
 ```sh
-# no permission flags — deno.json governs them
-dagger call deno project --path apps/api test
+dagger settings deno permissions all      # for a repo whose CI runs `deno test -A`
 ```
 
-Keeping permissions in `deno.json` means the same policy applies locally
-(`deno test -P`), in CI, and here — there's one source of truth. This uses config
-permission sets, which landed in Deno **2.5.0**; if you override `version` to an
-older release, `test` falls back to `-A` (grant all) since `-P` doesn't exist yet.
+Config permission sets landed in Deno **2.5.0**. If you set `version` to an
+older release, `"config"` falls back to `-A` for tests, since `-P` doesn't
+exist there.
+
+Other `deno test` flags go in `testArgs`. Doc tests (the code blocks in JSDoc
+comments and markdown) only run with `--doc`:
+
+```sh
+dagger settings deno testArgs '["--doc", "--parallel", "--ignore=_tools/"]'
+```
+
+Large suites can need a lot of memory in the Dagger engine: a test killed for
+running out of memory only reports `exit code: 137`. denoland/std's `cbor`
+tests needed about 12 GiB. Give the engine more memory, or leave the heavy
+tests out with `--ignore=…` in `testArgs`.
+
+### Type-check
+
+`type-check` runs `deno check .` from the project root; the config's `exclude`
+applies. Narrow it with `typeCheckTargets` and add flags with `typeCheckArgs` —
+for example when tooling scripts import remote modules:
+
+```sh
+dagger settings deno typeCheckTargets '["mod.ts", "src/"]'
+dagger settings deno typeCheckArgs '["--allow-import"]'
+```
 
 ### Format (`dagger generate`)
 
-`format` returns a **changeset**. Dagger prints the diff and asks before writing;
-add `-y` to apply it. `dagger generate` runs it on every selected project and
-workspace.
+`format` returns a **changeset**. `dagger generate` runs it on every selected
+project and workspace and summarizes the changed files (`apps/api/main.ts +3
+-1`), not the diff itself; it asks before writing. Without a terminal to ask
+on (CI, a coding agent), pass `-y` to write the changes or `--no-apply` to only
+list them:
 
 ```sh
-# apply it to your working tree
-dagger -y call deno project --path apps/api format
+dagger generate -y --deno-project=apps/api          # write them
+dagger generate --no-apply --deno-project=apps/api  # just list them
+dagger -y call deno project --path apps/api format  # one project, via call
 ```
 
 A changeset applies from the directory you run in, so from inside a project
@@ -289,10 +340,12 @@ dagger call deno project --path apps/api \
   compile --entrypoint main.ts --target x86_64-unknown-linux-gnu export --path ./bin/app
 ```
 
-Like `test`, `compile` takes no permission flags — the binary's baked-in
-permissions come from `deno.json`. Declare the app's default runtime permissions
-in a top-level `permissions.default` set (this is the `deno compile -P` set,
-distinct from `test.permissions`):
+Like `test`, `compile` takes its permissions from the `permissions` setting: with
+`"all"` the binary is built with `-A`, with `"none"` with no permissions. With
+the default `"config"`, the baked-in permissions come from `deno.json`: declare
+the app's default runtime permissions in a top-level `permissions.default` set
+(this is the `deno compile -P` set, distinct from `test.permissions`). Below
+Deno 2.5.0, `"config"` builds with no permissions rather than `-A`:
 
 ```jsonc
 // deno.json
@@ -319,8 +372,8 @@ dagger call deno version
 
 ### Configuration
 
-`version` and `base` are the module's settings (see [Quick start](#quick-start))
-and its constructor arguments, so `dagger call` takes them before the function:
+The settings (see [Quick start](#quick-start)) are also the module's
+constructor arguments, so `dagger call` takes them before the function:
 
 ```sh
 # pin a specific Deno version
@@ -328,6 +381,9 @@ dagger call deno --version 2.9.3 project --path apps/api test
 
 # bring your own base image
 dagger call deno --base docker.io/denoland/deno:debian project --path apps/api lint
+
+# grant all permissions and run doc tests
+dagger call deno --permissions all --test-args=--doc project --path apps/api test
 ```
 
 ## Extend it in your own module
@@ -352,7 +408,8 @@ type MyApp {
   CI for this app: reuse Deno's checks, add our own.
   """
   ci(ws: Workspace!): Void @check {
-    let project = deno(version: "2.9.3").project(ws, "apps/api")
+    let project = deno(version: "2.9.3", permissions: "all", testArgs: ["--doc"])
+      .project(ws, "apps/api")
     run(project.lint(ws))
     run(project.typeCheck(ws))
     run(project.test(ws))
