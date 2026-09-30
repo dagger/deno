@@ -513,7 +513,7 @@ type DenoProjects @collection {
   let tool: Deno!
 
   """
-  A standalone Deno project, keyed by its root.
+  A Deno project, keyed by its root; a workspace member runs from its workspace root.
   """
   project(path: String!): DenoProject! @get {
     tool.projectAt(path, enclosingWorkspace ?? path)

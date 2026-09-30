@@ -63,7 +63,7 @@ This adds a `[modules.deno]` entry to your `dagger.toml`. Its settings:
 | `permissions` | `"config"` | Permissions for `test` and `compile`: `"config"` (the deno.json permission sets, `-P`), `"all"` (`-A`) or `"none"`. See [Test permissions](#test-permissions). |
 | `testArgs` | `[]` | Extra `deno test` flags, e.g. `["--doc", "--parallel", "--ignore=_tools/"]`. |
 | `typeCheckArgs` | `[]` | Extra `deno check` flags, e.g. `["--allow-import"]`. |
-| `typeCheckTargets` | `["."]` | What `type-check` checks, relative to each project or workspace root, e.g. `["mod.ts"]`. |
+| `typeCheckTargets` | `["."]` | What `type-check` checks, relative to *each* project or workspace root, e.g. `["mod.ts"]`. See [Type-check](#type-check). |
 
 `dagger settings deno` lists them (its VALUE column shows only what you've
 set). Set one with `dagger settings deno <key> <value>`; list values are JSON:
@@ -72,9 +72,10 @@ set). Set one with `dagger settings deno <key> <value>`; list values are JSON:
 dagger settings deno version 2.9.3
 dagger settings deno permissions all
 dagger settings deno testArgs '["--doc"]'
+dagger settings -u deno testArgs           # unset: back to the default
 ```
 
-writes
+The first three write
 
 ```toml
 [modules.deno.settings]
@@ -120,18 +121,22 @@ no flag needed:
 cd apps/api/src && dagger check        # checks apps/api
 ```
 
-**4. Or call a function directly** — to run one thing on one project. `--path`
-may point *inside* a project; it snaps up to the nearest `deno.json` /
+**4. Or call functions directly.** `dagger call` reaches the rest of the API:
+looking a project up by path, its workspace root, `compile`, `container`.
+`--path` may point *inside* a project; it snaps up to the nearest `deno.json` /
 `deno.jsonc` (pass `--find-up=false` when it is already a root):
 
 ```sh
-dagger call deno project --path apps/api lint
+dagger call deno project --path apps/api/src path    # -> apps/api
 dagger call deno project --path apps/api test
-dagger call deno project --path apps/api/src type-check
 ```
 
+> **Use `dagger check` in CI.** `dagger call` on a check function (`lint`,
+> `test`, `type-check`, `format-check`) prints the result, but the command
+> exits 0 even when the check fails. `dagger check` fails the command.
+
 > Don't want to install? Run a function one-off with `-m`, dropping the module
-> name: `dagger -m github.com/dagger/deno call project --path apps/api lint`.
+> name: `dagger -m github.com/dagger/deno call project --path apps/api path`.
 
 ## Discovery
 
@@ -189,23 +194,23 @@ single `deno` command at the root, so the toolchain fans out across every member
 
 ```sh
 # run all members' checks at once (deno fans out from the root)
-dagger call deno workspace --path packages lint
-dagger call deno workspace --path packages test
-dagger call deno workspace --path packages type-check
+dagger check --deno-workspace=packages
+dagger check deno/workspaces/test --deno-workspace=packages
 
 # list the members
 dagger call deno workspace --path packages members path
 ```
 
-To work on **one** member, use `project` with the member's path. Its checks run
-from the workspace root (so the shared lockfile and sibling `@scope/pkg` imports
+To work on **one** member, run from inside it — the member is then the only
+project selected — or use `project` with the member's path. Its checks run from
+the workspace root (so the shared lockfile and sibling `@scope/pkg` imports
 resolve) and pass the member's directory as the target — `deno lint ui`,
 `deno test ui`, `deno check ui`, `deno fmt --check ui` — so they cover that
 member only. Its `container` has the whole workspace mounted with the member as
 the workdir, for your own commands:
 
 ```sh
-dagger call deno project --path packages/ui test
+cd packages/ui && dagger check                                # just the ui member
 dagger call deno project --path packages/ui workspace-root   # -> packages
 ```
 
@@ -298,13 +303,27 @@ tests out with `--ignore=…` in `testArgs`.
 ### Type-check
 
 `type-check` runs `deno check .` from the project root; the config's `exclude`
-applies. Narrow it with `typeCheckTargets` and add flags with `typeCheckArgs` —
-for example when tooling scripts import remote modules:
+applies. Add flags with `typeCheckArgs` — for example when tooling scripts
+import remote modules:
+
+```sh
+dagger settings deno typeCheckArgs '["--allow-import"]'
+```
+
+`typeCheckTargets` replaces the `.`, and like every setting it applies to every
+project and workspace the module checks. Each target is resolved against *each*
+root: a workspace member runs `deno check <member>/mod.ts`, a Deno workspace
+`deno check mod.ts` at its root, a standalone project `deno check mod.ts` in
+its own directory. So `["mod.ts"]` only works where every project and
+workspace has a `mod.ts` — a workspace root without one fails with `TS2307`.
 
 ```sh
 dagger settings deno typeCheckTargets '["mod.ts", "src/"]'
-dagger settings deno typeCheckArgs '["--allow-import"]'
 ```
+
+When projects differ, leave `typeCheckTargets` at `.` and shape what gets
+checked per project instead: list what to skip in each `deno.json`'s `exclude`,
+or pass flags with `typeCheckArgs`.
 
 ### Format (`dagger generate`)
 
@@ -373,16 +392,18 @@ dagger call deno version
 ### Configuration
 
 The settings (see [Quick start](#quick-start)) are also the module's
-constructor arguments, so `dagger call` takes them before the function:
+constructor arguments, so `dagger call` takes them before the function. For
+`dagger check`, set them with `dagger settings` instead.
 
 ```sh
 # pin a specific Deno version
-dagger call deno --version 2.9.3 project --path apps/api test
+dagger call deno --version 2.9.3 version
 
 # bring your own base image
-dagger call deno --base docker.io/denoland/deno:debian project --path apps/api lint
+dagger call deno --base docker.io/denoland/deno:debian project --path apps/api \
+  compile --entrypoint main.ts export --path ./bin/app
 
-# grant all permissions and run doc tests
+# grant all permissions and run doc tests (a check: exits 0 even if it fails)
 dagger call deno --permissions all --test-args=--doc project --path apps/api test
 ```
 
