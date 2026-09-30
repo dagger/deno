@@ -16,14 +16,9 @@ type DenoProject {
   workspaceRoot: String!
 
   """
-  Base container carrying the Deno toolchain, inherited from the Deno root.
+  The Deno toolchain and settings this project runs with.
   """
-  let base: Container!
-
-  """
-  Deno version configured on the root, used to gate version-specific flags.
-  """
-  let version: String!
+  let tool: Deno!
 
   """
   This project's deno.json / deno.jsonc file.
@@ -50,20 +45,23 @@ type DenoProject {
   container(ws: Workspace!): Container! {
     # A standalone project mounts its own subtree. A workspace member mounts the
     # whole workspace root with the workdir at the member, so `deno` walks up to
-    # the shared deno.lock, import map, and sibling members while still scoping
-    # each command to this member.
-    let rel = if (path == workspaceRoot) { "" } else {
+    # the shared deno.lock, import map, and sibling members.
+    let workdir = if (member == "") { "/src" } else { "/src/" + member }
+    tool.mounted(ws, workspaceRoot).withWorkdir(workdir)
+  }
+
+  """
+  This member's directory relative to its workspace root, or "" for a
+  standalone project.
+  """
+  let member: String! {
+    if (path == workspaceRoot) {
+      ""
+    } else if (workspaceRoot == ".") {
+      path
+    } else {
       path.trimPrefix(workspaceRoot + "/")
     }
-    let workdir = if (rel == "") { "/src" } else { "/src/" + rel }
-    base
-      .withEnvVariable("DENO_DIR", "/deno-dir")
-      .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
-      .withDirectory(
-        "/src",
-        ws.directory("/" + workspaceRoot, exclude: [".git", "**/node_modules"]),
-      )
-      .withWorkdir(workdir)
   }
 
   """
@@ -117,11 +115,12 @@ type DenoProject {
     """
     target: String = null,
   ): File! {
-    # The binary's baked-in permissions come from deno.json's default permission
-    # set via `-P`, as for `test`. Below Deno 2.5.0 (no `-P`) it gets none, rather
-    # than forcing `-A` into a shipped artifact.
+    # The binary's baked-in permissions follow the `permissions` setting, as for
+    # `test`: by default deno.json's default permission set via `-P`. Below Deno
+    # 2.5.0 (no `-P`) it gets none, rather than forcing `-A` into a shipped
+    # artifact.
     let targetFlag = if (target == null) { [] } else { ["--target", target] }
-    let permissionFlag = if (supportsPermissionSets) { ["-P"] } else { [] }
+    let permissionFlag = tool.permissionFlags(true)
     let out = "/tmp/out/" + outputName
     container(ws)
       .withExec(["deno", "compile"] + permissionFlag + ["--output", out] + targetFlag + [entrypoint])
@@ -129,28 +128,12 @@ type DenoProject {
   }
 
   """
-  The `deno` command line for one of the checks, by function name.
+  Run one of the checks. A workspace member's commands run from the workspace
+  root, scoped to the member's directory, the way `deno test <member>` does in
+  the workspace's own CI: tests that expect the root as their cwd still pass.
   """
-  let args(command: String!): [String!]! {
-    if (command == "lint") {
-      ["deno", "lint"]
-    } else if (command == "test") {
-      # --permit-no-files: a project with no test files is a pass, not an error.
-      # -P applies deno.json's permission config (>= 2.5.0); older Deno has no
-      # -P, so it gets -A (grant all) instead.
-      let permissionFlag = if (supportsPermissionSets) { "-P" } else { "-A" }
-      ["deno", "test", "--permit-no-files", permissionFlag]
-    } else if (command == "typeCheck") {
-      ["deno", "check", "."]
-    } else if (command == "formatCheck") {
-      ["deno", "fmt", "--check"]
-    } else {
-      raise "unknown Deno command: " + command
-    }
-  }
-
   let exec(ws: Workspace!, command: String!): Container! {
-    container(ws).withExec(args(command))
+    tool.mounted(ws, workspaceRoot).withExec(tool.command(command, member))
   }
 
   """
@@ -166,7 +149,10 @@ type DenoProject {
   This project after `deno fmt`.
   """
   let formatted(ws: Workspace!): Directory! {
-    container(ws).withExec(["deno", "fmt"]).directory(".")
+    tool
+      .mounted(ws, workspaceRoot)
+      .withExec(tool.command("format", member))
+      .directory(if (member == "") { "." } else { member })
   }
 
   """
@@ -187,36 +173,6 @@ type DenoProject {
       tree.directory(base)
     } else {
       tree.directory(base.trimPrefix(path + "/"))
-    }
-  }
-
-  """
-  Numeric >= for two non-negative integer strings without leading zeros: the
-  longer one is larger, and equal lengths compare lexically (which matches
-  numeric order for same-width digits).
-  """
-  let numGte(a: String!, b: String!): Boolean! {
-    let da = a.split("").length
-    let db = b.split("").length
-    if (da != db) { da > db } else { a >= b }
-  }
-
-  """
-  Whether the configured Deno version supports config-file permission sets and
-  the `-P` flag (added in Deno 2.5.0). Compares the version's major.minor via
-  numGte (no numeric parsing needed).
-  """
-  let supportsPermissionSets: Boolean! {
-    let parts = version.split(".")
-    let major = parts[0] ?? "0"
-    let minor = if (parts.length > 1) { parts[1] ?? "0" } else { "0" }
-    # >= 2.5.0: major >= 3, or major == 2 and minor >= 5.
-    if (numGte(major, "3")) {
-      true
-    } else if (major == "2") {
-      numGte(minor, "5")
-    } else {
-      false
     }
   }
 }

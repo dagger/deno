@@ -402,6 +402,150 @@ type E2e {
   }
 
   """
+  The `permissions` setting: a project with no permission sets in deno.json
+  fails `test` under the default "config" (-P grants nothing) and passes under
+  "all" (-A); "none" ignores the config, so the perm-net fixture's net grant is
+  gone; anything else is rejected. `compile` follows the same setting.
+  """
+  permissionsSettingCheck(ws: Workspace!): Void @check {
+    let w = directory
+      .withNewFile("deno.json", "{}\n")
+      .withNewFile(
+        "net_test.ts",
+        "Deno.test(\"net\", async () => {\n  const s = await Deno.permissions.query({ name: \"net\" });\n  if (s.state !== \"granted\") throw new Error(\"net \" + s.state);\n});\n",
+      )
+      .withNewFile("main.ts", "const s = await Deno.permissions.query({ name: \"net\" });\nconsole.log(\"NET:\" + s.state);\n")
+      .asWorkspace
+    assert(
+      { run(deno.project(w, ".").test(w)); false } rescue true,
+      "config granted net to a project without permission sets",
+    )
+    run(deno(permissions: "all").project(w, ".").test(w))
+    run(deno(permissions: "all").projects(w).batch.test(w))
+    assert(
+      {
+        run(
+          deno(permissions: "none").project(ws, permNetPath).test(ws),
+        )
+        false
+      } rescue true,
+      "none still applied the deno.json permission set",
+    )
+
+    assert(
+      { deno(permissions: "ALL").version; false } rescue true,
+      "an unknown permissions mode was accepted",
+    )
+
+    let bin = deno(permissions: "all").project(w, ".").compile(
+      w,
+      entrypoint: "main.ts",
+    )
+    let output = container
+      .from("debian:stable-slim")
+      .withFile("/app", bin, permissions: 493)
+      .withExec(["/app"])
+      .stdout
+    assert(output.contains("NET:granted"), "compile with all did not grant net: " + output)
+    null
+  }
+
+  """
+  `testArgs` reach `deno test`: a failing doc example only fails with --doc.
+  """
+  testArgsCheck: Void @check {
+    let w = directory
+      .withNewFile("deno.json", "{}\n")
+      .withNewFile(
+        "mod.ts",
+        "/**\n * @example\n * ```ts\n * throw new Error(\"doc example ran\");\n * ```\n */\nexport const x = 1;\n",
+      )
+      .asWorkspace
+    run(deno.project(w, ".").test(w))
+    let failure = { run(deno(testArgs: ["--doc"]).project(w, ".").test(w)); "unexpected success" } rescue {
+      err: Error => err.message
+    }
+    assert(failure.contains("exit code"), "--doc did not run the failing doc example: " + failure)
+    null
+  }
+
+  """
+  `type-check` honours the config's `exclude`, `typeCheckTargets` narrows what it
+  checks, and `typeCheckArgs` reach `deno check`.
+  """
+  typeCheckSettingsCheck: Void @check {
+    let files = directory
+      .withNewFile("mod.ts", "export const n: number = 1;\n")
+      .withNewFile("tools/bad.ts", "export const n: number = \"not a number\";\n")
+    let excluded = files.withNewFile("deno.json", "{\n  \"exclude\": [\"tools\"]\n}\n").asWorkspace
+    run(deno.project(excluded, ".").typeCheck(excluded))
+
+    let w = files.withNewFile("deno.json", "{}\n").asWorkspace
+    assert(
+      { run(deno.project(w, ".").typeCheck(w)); false } rescue true,
+      "type-check of `.` missed the type error in tools/",
+    )
+    run(deno(typeCheckTargets: ["mod.ts"]).project(w, ".").typeCheck(w))
+    run(deno(typeCheckTargets: ["mod.ts"]).projects(w).batch.typeCheck(w))
+    assert(
+      {
+        run(
+          deno(typeCheckArgs: ["--not-a-deno-flag"]).project(w, ".").typeCheck(w),
+        )
+        false
+      } rescue true,
+      "typeCheckArgs did not reach deno check",
+    )
+    null
+  }
+
+  """
+  A workspace member's commands run from the workspace root, scoped to the
+  member: its tests see the root as their cwd (as `deno test <member>` does),
+  and lint, format-check, type-check and format still only cover the member.
+  """
+  memberScopeCheck: Void @check {
+    let base = directory
+      .withNewFile("deno.json", "{\n  \"workspace\": [\"./add\", \"./util\"]\n}\n")
+      .withNewFile(
+        "add/deno.json",
+        "{\n  \"name\": \"@ws/add\",\n  \"exports\": \"./mod.ts\",\n  \"test\": { \"permissions\": { \"read\": true } }\n}\n",
+      )
+      .withNewFile("add/mod.ts", "export const a = 1;\n")
+      .withNewFile(
+        "add/mod_test.ts",
+        "Deno.test(\"runs from the workspace root\", () => {\n  const root = Deno.readTextFileSync(\"deno.json\");\n  if (!root.includes(\"workspace\")) {\n    throw new Error(\"cwd is not the workspace root\");\n  }\n});\n",
+      )
+      .withNewFile("util/deno.json", "{\n  \"name\": \"@ws/util\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      # A dirty, lint-failing, type-broken sibling the member's checks must not see.
+      .withNewFile("util/mod.ts", "export function f(a:number){var b: string = a; return b}\n")
+    let w = base.asWorkspace
+    let add = deno.project(w, "add")
+    run(add.test(w))
+    # Control: the same tests from the member's own directory (its container's
+    # workdir, where they used to run) can't find the root deno.json.
+    assert(
+      { add.container(w).withExec(["deno", "test", "-P"]).sync; false } rescue true,
+      "the cwd fixture passes from the member directory too, so it proves nothing",
+    )
+    run(add.lint(w))
+    run(add.formatCheck(w))
+    run(add.typeCheck(w))
+    assert(
+      { run(deno.project(w, "util").lint(w)); false } rescue true,
+      "the sibling fixture is supposed to fail lint",
+    )
+
+    let dirty = base.withNewFile("add/extra.ts", "export function g(b:number){return b}\n").asWorkspace
+    let changes = deno.project(dirty, "add").format(dirty)
+    assert(
+      changes.modifiedPaths == ["add/extra.ts"],
+      "member format reached outside the member: " + changes.modifiedPaths.join(", "),
+    )
+    null
+  }
+
+  """
   At a project root, only that project and the ones below it are keys: an
   enclosing project is not, though `project` still reaches it by path.
   """

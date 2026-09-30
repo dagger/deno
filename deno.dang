@@ -7,16 +7,77 @@ type Deno {
   """
   Deno version for the default base image.
   """
-  version: String! = "2.9.3"
+  version: String!
 
   """
   Base container for Deno commands. Must have `deno` on PATH.
   """
-  base: Container! =
-    container
-      .from("denoland/deno:alpine-" + version)
-      .withoutEntrypoint
-      .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
+  base: Container!
+
+  """
+  Permissions `test` and `compile` run with: "config", "all" or "none".
+  """
+  permissions: String!
+
+  """
+  Extra `deno test` flags, e.g. ["--doc", "--parallel"].
+  """
+  testArgs: [String!]!
+
+  """
+  Extra `deno check` flags, e.g. ["--allow-import"].
+  """
+  typeCheckArgs: [String!]!
+
+  """
+  What `type-check` checks, relative to each project or workspace root.
+  """
+  typeCheckTargets: [String!]!
+
+  new(
+    """
+    Deno version for the default base image (denoland/deno:alpine-<version>).
+    """
+    version: String! = "2.9.3",
+    """
+    Base container for Deno commands. Must have `deno` on PATH.
+    """
+    base: Container = null,
+    """
+    Permissions `test` and `compile` run with: "config" uses the deno.json
+    permission sets (-P), "all" grants everything (-A), "none" grants nothing.
+    """
+    permissions: String! = "config",
+    """
+    Extra `deno test` flags, e.g. ["--doc", "--parallel", "--ignore=_tools/"].
+    """
+    testArgs: [String!]! = [],
+    """
+    Extra `deno check` flags, e.g. ["--allow-import"].
+    """
+    typeCheckArgs: [String!]! = [],
+    """
+    What `type-check` checks, relative to each project or workspace root, e.g.
+    ["mod.ts"]. The config's `exclude` still applies.
+    """
+    typeCheckTargets: [String!]! = ["."],
+  ) {
+    self.version = version
+    self.base = base
+      ?? container
+        .from("denoland/deno:alpine-" + version)
+        .withoutEntrypoint
+        .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
+    # A string rather than an enum: enum settings can't be read from dagger.toml.
+    if (["config", "all", "none"].contains(permissions) == false) {
+      raise "permissions must be \"config\", \"all\" or \"none\", got: " + permissions
+    }
+    self.permissions = permissions
+    self.testArgs = testArgs
+    self.typeCheckArgs = typeCheckArgs
+    self.typeCheckTargets = typeCheckTargets
+    self
+  }
 
   """
   Install the Deno CLI and cache into a glibc-based container.
@@ -101,11 +162,116 @@ type Deno {
   }
 
   let projectAt(path: String!, workspaceRoot: String!): DenoProject! {
-    DenoProject(path: path, workspaceRoot: workspaceRoot, base: base, version: version)
+    DenoProject(path: path, workspaceRoot: workspaceRoot, tool: self)
   }
 
   let workspaceAt(path: String!): DenoWorkspace! {
-    DenoWorkspace(path: path, base: base, version: version)
+    DenoWorkspace(path: path, tool: self)
+  }
+
+  """
+  A container with the Deno toolchain and cache, and `dir` of the workspace
+  mounted at /src as the workdir.
+  """
+  let mounted(ws: Workspace!, dir: String!): Container! {
+    base
+      .withEnvVariable("DENO_DIR", "/deno-dir")
+      .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
+      .withDirectory(
+        "/src",
+        ws.directory("/" + dir, exclude: [".git", "**/node_modules"]),
+      )
+      .withWorkdir("/src")
+  }
+
+  """
+  The `deno` command line for one of the checks (by function name) or
+  "format", run from the mounted root. `target` scopes it to a workspace
+  member's directory; "" runs it on the whole mount.
+  """
+  let command(name: String!, target: String!): [String!]! {
+    let targets = if (target == "") { [] } else { [target] }
+    if (name == "lint") {
+      ["deno", "lint"] + targets
+    } else if (name == "test") {
+      # --permit-no-files: a project with no test files is a pass, not an error.
+      ["deno", "test", "--permit-no-files"] + permissionFlags(false) + testArgs + targets
+    } else if (name == "typeCheck") {
+      ["deno", "check"] + typeCheckArgs + typeCheckTargets.map { t =>
+        under(
+          target,
+          t,
+        )
+      }
+    } else if (name == "formatCheck") {
+      ["deno", "fmt", "--check"] + targets
+    } else if (name == "format") {
+      ["deno", "fmt"] + targets
+    } else {
+      raise "unknown Deno command: " + name
+    }
+  }
+
+  """
+  A path relative to `dir` ("" or "." for the mount root), as seen from the root.
+  """
+  let under(dir: String!, rel: String!): String! {
+    let r = rel.trimPrefix("./").trimSuffix("/")
+    if (dir == "" or dir == ".") {
+      rel
+    } else if (r == "." or r == "") {
+      dir
+    } else {
+      dir + "/" + r
+    }
+  }
+
+  """
+  The permission flags for `deno test` (compile: false) or `deno compile`.
+  "config" uses -P, which Deno added in 2.5.0: below it, test falls back to -A
+  and compile to no flag, rather than bake grant-all into a shipped binary.
+  """
+  let permissionFlags(compile: Boolean!): [String!]! {
+    if (permissions == "all") {
+      ["-A"]
+    } else if (permissions == "none") {
+      []
+    } else if (supportsPermissionSets) {
+      ["-P"]
+    } else if (compile) {
+      []
+    } else {
+      ["-A"]
+    }
+  }
+
+  """
+  Numeric >= for two non-negative integer strings without leading zeros: the
+  longer one is larger, and equal lengths compare lexically (which matches
+  numeric order for same-width digits).
+  """
+  let numGte(a: String!, b: String!): Boolean! {
+    let da = a.split("").length
+    let db = b.split("").length
+    if (da != db) { da > db } else { a >= b }
+  }
+
+  """
+  Whether the configured Deno version supports config-file permission sets and
+  the `-P` flag (added in Deno 2.5.0).
+  """
+  let supportsPermissionSets: Boolean! {
+    let parts = version.split(".")
+    let major = parts[0] ?? "0"
+    let minor = if (parts.length > 1) { parts[1] ?? "0" } else { "0" }
+    # >= 2.5.0: major >= 3, or major == 2 and minor >= 5.
+    if (numGte(major, "3")) {
+      true
+    } else if (major == "2") {
+      numGte(minor, "5")
+    } else {
+      false
+    }
   }
 
   """
@@ -347,7 +513,7 @@ type DenoProjects @collection {
   let tool: Deno!
 
   """
-  The Deno project rooted at path.
+  A standalone Deno project, keyed by its root.
   """
   project(path: String!): DenoProject! @get {
     tool.projectAt(path, enclosingWorkspace ?? path)
@@ -424,7 +590,7 @@ type DenoWorkspaces @collection {
   let tool: Deno!
 
   """
-  The Deno workspace rooted at path.
+  A Deno workspace, keyed by its root; its checks cover every member.
   """
   workspace(path: String!): DenoWorkspace! @get {
     tool.workspaceAt(path)
