@@ -546,6 +546,97 @@ type E2e {
   }
 
   """
+  Configs are classified the way deno reads them. deno.jsonc is parsed as JSONC
+  (comments and trailing commas stripped, `//` inside strings kept), so a
+  comment that mentions or demonstrates "workspace" doesn't make a workspace;
+  in a directory with both files deno.json wins; and a config that doesn't
+  parse is keyed as a project, whose checks then fail with deno's error.
+  """
+  jsoncConfigCheck: Void @check {
+    let tree = directory
+      # A comment mentioning the word, with a nested project below it.
+      .withNewFile(
+        "mirror/deno.jsonc",
+        "{\n  // Standalone on purpose: not a member of the \"workspace\" at ../packages.\n  \"name\": \"@x/mirror\",\n  \"exports\": \"./mod.ts\",\n}\n",
+      )
+      .withNewFile("mirror/mod.ts", "export const m = 1;\n")
+      .withNewFile("mirror/sub/deno.json", "{}\n")
+      # A comment demonstrating the syntax.
+      .withNewFile(
+        "template/deno.jsonc",
+        "{\n  // To become one, add e.g. \"workspace\": [\"./a\", \"./b\"] below.\n  \"name\": \"@x/template\"\n}\n",
+      )
+      # A genuine JSONC workspace with a block comment and trailing commas.
+      .withNewFile("plugins/deno.jsonc", "{\n  /* a genuine workspace */\n  \"workspace\": [\n    \"./a\",\n  ],\n}\n")
+      .withNewFile("plugins/a/deno.json", "{\n  \"name\": \"@p/a\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile("plugins/a/mod.ts", "export const a = 1;\n")
+      # `//` inside a string value must not start a comment.
+      .withNewFile(
+        "urls/deno.jsonc",
+        "{\n  // remote std\n  \"imports\": { \"std/\": \"https://deno.land/std@0.224.0/\" },\n  \"workspace\": [\"./m\"]\n}\n",
+      )
+      .withNewFile("urls/m/deno.json", "{\n  \"name\": \"@u/m\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile("urls/m/mod.ts", "export const u = 1;\n")
+      # deno.json declares the workspace; a stale deno.jsonc beside it doesn't.
+      .withNewFile("both/deno.json", "{\n  \"workspace\": [\"./core\"]\n}\n")
+      .withNewFile("both/deno.jsonc", "{\n  \"name\": \"@stale/both\"\n}\n")
+      .withNewFile("both/core/deno.json", "{\n  \"name\": \"@b/core\",\n  \"exports\": \"./mod.ts\"\n}\n")
+      .withNewFile("both/core/mod.ts", "export const c = 1;\n")
+      .withNewFile("both/fixtures/data.txt", "data\n")
+      # ...and the reverse: a stale deno.jsonc declares one, deno.json doesn't.
+      .withNewFile("cli/deno.json", "{\n  \"version\": \"from-deno-json\"\n}\n")
+      .withNewFile("cli/deno.jsonc", "{\n  \"version\": \"from-deno-jsonc\",\n  \"workspace\": [\"./x\"]\n}\n")
+      .withNewFile("cli/mod.ts", "export const cli = 1;\n")
+      # Not even JSONC.
+      .withNewFile("broken/deno.jsonc", "{\n  \"workspace\": [\"./a\"] ,,\n}\n")
+      .withNewFile("broken/mod.ts", "export const b = 1;\n")
+    let w = tree.asWorkspace
+
+    let projects = deno.projects(w).keys
+    let workspaces = deno.workspaces(w).keys
+    assert(
+      workspaces.length == 3
+        and contains(workspaces, "plugins")
+        and contains(workspaces, "urls")
+        and contains(workspaces, "both"),
+      "workspaces: " + workspaces.join(", "),
+    )
+    assert(
+      projects.length == 5
+        and contains(projects, "mirror")
+        and contains(projects, "mirror/sub")
+        and contains(projects, "template")
+        and contains(projects, "cli")
+        and contains(projects, "broken"),
+      "projects: " + projects.join(", "),
+    )
+
+    # The genuine JSONC workspace runs under deno too.
+    run(deno.workspaces(w).subset(keys: ["plugins"]).batch.lint(w))
+
+    # The file deno reads, from the accessors and from inside the workspace.
+    assert(
+      deno.project(w, "cli").config(w).contents.contains("from-deno-json\""),
+      "project config did not return deno.json",
+    )
+    assert(
+      deno.workspace(w, "both").config(w).contents.contains("\"workspace\""),
+      "workspace config did not return deno.json",
+    )
+    let inFixtures = tree.asWorkspace(cwd: "both/fixtures")
+    assert(deno.workspaces(inFixtures).keys == ["both"], "from both/fixtures: workspace not found")
+    assert(deno.projects(inFixtures).keys.length == 0, "from both/fixtures: the workspace was keyed as a project")
+    assert(deno.project(w, "both/core").workspaceRoot == "both", "member did not resolve its workspace through deno.json")
+
+    # The malformed config fails loudly through its checks.
+    assert(
+      { run(deno.project(w, "broken").lint(w)); false } rescue true,
+      "a malformed deno.jsonc passed lint",
+    )
+    null
+  }
+
+  """
   At a project root, only that project and the ones below it are keys: an
   enclosing project is not, though `project` still reaches it by path.
   """

@@ -161,7 +161,10 @@ A project above a project root you stand in is not selected; `project` /
 Each config directory then lands in exactly one collection:
 
 - A directory whose config declares a non-empty `workspace` array is a **Deno
-  workspace** (`workspaces`, keyed by its root).
+  workspace** (`workspaces`, keyed by its root). The config is the one deno
+  reads: `deno.json` when a directory has both, and `deno.jsonc` is parsed as
+  JSONC, so comments and trailing commas are fine. A config that doesn't parse
+  counts as a standalone project, whose checks then fail with deno's error.
 - A directory below a discovered workspace root is one of its members and is
   checked through the workspace, not on its own.
 - Every other directory is a **standalone project** (`projects`, keyed by its

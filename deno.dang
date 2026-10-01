@@ -360,9 +360,11 @@ type Deno {
         paths: [cwdPath(ws)],
         globs: ["deno.json", "deno.jsonc", "!**/node_modules", "!**/.git"],
       ).{{filePath}}
-      .map { r => r.filePath.trimPrefix("/").trimPrefix("./") }
-      .filter { file => isWorkspaceConfig(ws, file) }
-      .map { file => configDirOf(file) }
+      .map { r => configDirOf(r.filePath.trimPrefix("/").trimPrefix("./")) }
+      .uniq
+      # Over-matching is fine: each candidate is decided from the config deno
+      # actually reads there (deno.json before deno.jsonc), parsed properly.
+      .filter { dir => isWorkspaceRoot(ws, dir) }
     dirs.filter { dir =>
       if (inCone(ws, dir)) { below.contains(dir) } else { isWorkspaceRoot(ws, dir) }
     }
@@ -380,12 +382,33 @@ type Deno {
   Whether deno.json / deno.jsonc text declares a non-empty `workspace` array.
   """
   let declaresWorkspace(text: String!): Boolean! {
-    # deno.jsonc with comments/trailing commas isn't strict JSON; fall back
-    # to a presence check on the `workspace` key.
+    # A config that doesn't parse even as JSONC is not a workspace. Raising
+    # here would fail listing for the whole Dagger workspace over one file;
+    # instead the directory is keyed as a project, and its checks fail with
+    # deno's own parse error, naming the file.
     {
-      let cfg: DenoConfig! = JSON.decode(text)
+      let cfg: DenoConfig! = JSON.decode(stripJsonc(text))
       cfg.workspace.length > 0
-    } rescue text.contains("\"workspace\"")
+    } rescue false
+  }
+
+  """
+  deno.jsonc text as strict JSON: comments dropped, trailing commas removed.
+  A no-op on deno.json.
+  """
+  let stripJsonc(text: String!): String! {
+    # One pass, string literals first in the alternation, so a `//` inside a
+    # value (a URL in `imports`) is never read as a comment opener, and a
+    # string such as "a,}" keeps its comma.
+    text.rewriteMatches(`"(?:[^"\\]|\\.)*"|//[^\n]*|/\*(?s:.*?)\*/|,\s*[}\]]`) { m =>
+      if (m.string.hasPrefix("\"")) {
+        m.string
+      } else if (m.string.hasPrefix(",")) {
+        m.string.trimPrefix(",")
+      } else {
+        ""
+      }
+    }
   }
 
   """
@@ -414,10 +437,11 @@ type Deno {
       json
     } else {
       # Both exist somewhere above: the deeper one is nearer. In the same
-      # directory deno.jsonc wins, as it does for deno itself.
+      # directory deno.json wins: deno reads it first and only falls back to
+      # deno.jsonc.
       let jsonDir = configDirOf(json)
       let jsoncDir = configDirOf(jsonc)
-      if (jsoncDir == jsonDir or underRoot(jsoncDir, jsonDir)) { jsonc } else { json }
+      if (jsoncDir != jsonDir and underRoot(jsoncDir, jsonDir)) { jsonc } else { json }
     }
   }
 

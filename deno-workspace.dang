@@ -20,10 +20,11 @@ type DenoWorkspace {
   """
   config(ws: Workspace!): File! {
     let dir = ws.directory("/" + path)
-    if (dir.glob("deno.jsonc").length > 0) {
-      dir.file("deno.jsonc")
-    } else {
+    # deno reads deno.json first and only falls back to deno.jsonc.
+    if (dir.glob("deno.json").length > 0) {
       dir.file("deno.json")
+    } else {
+      dir.file("deno.jsonc")
     }
   }
 
