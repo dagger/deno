@@ -1,6 +1,16 @@
 # Design: `dagger/deno` — a Dagger module for Deno projects
 
 · Status: **in progress** (v0.1 + v0.2 workspace support shipped — see §0 / §9) 
+· **Superseded in part (v1.0.0-beta.15):** the aggregate `*All` verbs
+  (`lintAll`, `testAll`, `typeCheckAll`, `formatCheckAll`, `formatAll`) below
+  were replaced by two Dagger collections, `projects(ws): DenoProjects` and
+  `workspaces(ws): DenoWorkspaces`, whose batch `lint`/`test`/`typeCheck`/
+  `formatCheck` checks and `format` generator run over the selected keys
+  (`deno/projects/test`, `--deno-project=PATH`). Keys follow `findRoots`
+  (the enclosing project is selected from a subdirectory), and `test`'s
+  permissions are a `permissions` setting ("config" = `-P`, "all", "none").
+  The [README](../README.md) describes the current API; the rest of this
+  document is the original design record. 
 · SDK: **Dang** 
 · Module name: **`deno`** 
 · Root type: **`Deno`**
@@ -210,12 +220,12 @@ commands out:
 Deno                       (toolchain config: version, base)
  ├─ version, base          constructor inputs (base derived from version)
  ├─ install(ctr)           install the Deno CLI + cache into any container
- ├─ workspaces(ws)         discover workspace roots (from cwd: self+descendants+nearest ancestor) → [DenoWorkspace]
+ ├─ workspaces(ws)         workspace roots discovered from the cwd → DenoWorkspaces collection
  ├─ workspace(ws, path)    resolve the workspace containing a path
- ├─ projects(ws)           discover STANDALONE deno.json(c) (from cwd, same reach) → [DenoProject]
+ ├─ projects(ws)           STANDALONE deno.json(c) discovered from the cwd → DenoProjects collection
  ├─ project(ws, path)      resolve the project containing a path (+ its workspace root)
- ├─ lintAll/testAll/...    check the caller's cone: workspaces (fan-out) + standalone (@check)
- └─ formatAll(ws)          format the caller's cone → one Changeset (@generate)
+ └─ (collections' batches: lint/test/typeCheck/formatCheck @check, format @generate
+     — these replaced the original lintAll/testAll/.../formatAll aggregates)
 
 DenoWorkspace              (a monorepo: root deno.json with a `workspace` array)
  ├─ path                   workspace root, identity
