@@ -47,8 +47,8 @@ type DenoProject {
     # A standalone project mounts its own subtree. A workspace member mounts the
     # whole workspace root with the workdir at the member, so `deno` walks up to
     # the shared deno.lock, import map, and sibling members.
-    let workdir = if (member == "") { "/src" } else { "/src/" + member }
-    tool.mounted(ws, workspaceRoot).withWorkdir(workdir)
+    let base = tool.mounted(ws, workspaceRoot)
+    if (member == "") { base } else { base.withWorkdir(tool.containerPath(workspaceRoot) + "/" + member) }
   }
 
   """
@@ -134,7 +134,20 @@ type DenoProject {
   the workspace's own CI: tests that expect the root as their cwd still pass.
   """
   let exec(ws: Workspace!, command: String!): Container! {
-    tool.mounted(ws, workspaceRoot).withExec(tool.command(command, member))
+    let ctr = tool.mounted(ws, workspaceRoot)
+    if (command == "test") {
+      # With its own session rather than the one running deno, a module address
+      # resolves against the user's workspace instead of against this module.
+      # The engine mounts a version-matched CLI on PATH for it, which a
+      # TypeScript client on SDK v1.0.4 or later finds by itself; an older one
+      # only reads _EXPERIMENTAL_DAGGER_CLI_BIN, so keep setting it until those
+      # are out of support. Only tests run user code, so only tests need it.
+      ctr
+        .withEnvVariable("_EXPERIMENTAL_DAGGER_CLI_BIN", "/dev/.dagger/dagger")
+        .withExec(tool.command(command, member), daggerInDaggerNewSession: true)
+    } else {
+      ctr.withExec(tool.command(command, member))
+    }
   }
 
   """

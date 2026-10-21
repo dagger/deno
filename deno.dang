@@ -178,10 +178,26 @@ type Deno {
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
       .withDirectory(
-        "/src",
+        containerPath(dir),
         ws.directory("/" + dir, exclude: [".git", "**/node_modules"]),
       )
-      .withWorkdir("/src")
+      # A test that uses a Dagger SDK opens a session from inside this
+      # container, and a session finds its workspace root by walking up to a
+      # .git directory. Without one it gets an empty workspace, so every
+      # workspace-relative API fails there -- including the serveModule a
+      # generated module client calls before its first query. The marker only
+      # has to exist, so synthesize an empty one rather than uploading the real
+      # git directory; a workspace built from a Directory has none to upload.
+      .withDirectory("/src/.git", directory)
+      .withWorkdir(containerPath(dir))
+  }
+
+  """
+  A workspace-root-relative path as an absolute one in the container, which
+  mirrors the workspace so that workspace-relative addresses resolve there.
+  """
+  let containerPath(p: String!): String! {
+    if (p == "." or p == "") { "/src" } else { "/src/" + p }
   }
 
   """
