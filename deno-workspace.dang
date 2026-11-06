@@ -86,11 +86,21 @@ type DenoWorkspace {
   }
 
   """
-  Run tests in every member of this workspace with `deno test`.
+  Run tests in every member of this workspace in one `deno test`. A plain
+  function, not a check: `dagger check` runs one check per file in `testFiles`.
   """
-  test(ws: Workspace!): Void @check {
+  test(ws: Workspace!): Void {
     exec(ws, "test").sync
     null
+  }
+
+  """
+  The test files of every member, keyed by workspace-relative path. Each has
+  a `test` check, and every selected file runs in one shared `deno test` at
+  the workspace root.
+  """
+  testFiles(ws: Workspace!): DenoTestFiles! {
+    tool.testFiles(ws, path, "", true)
   }
 
   """

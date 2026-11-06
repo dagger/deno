@@ -48,7 +48,9 @@ type DenoProject {
     # whole workspace root with the workdir at the member, so `deno` walks up to
     # the shared deno.lock, import map, and sibling members.
     let base = tool.mounted(ws, workspaceRoot)
-    if (member == "") { base } else { base.withWorkdir(tool.containerPath(workspaceRoot) + "/" + member) }
+    if (member == "") { base } else {
+      base.withWorkdir(tool.containerPath(workspaceRoot) + "/" + member)
+    }
   }
 
   """
@@ -74,11 +76,20 @@ type DenoProject {
   }
 
   """
-  Run this project's tests with `deno test`.
+  Run all of this project's tests in one `deno test`. A plain function, not a
+  check: `dagger check` runs one check per file in `testFiles`.
   """
-  test(ws: Workspace!): Void @check {
+  test(ws: Workspace!): Void {
     exec(ws, "test").sync
     null
+  }
+
+  """
+  This project's test files, keyed by workspace-relative path. Each has a
+  `test` check, and every selected file runs in one shared `deno test`.
+  """
+  testFiles(ws: Workspace!): DenoTestFiles! {
+    tool.testFiles(ws, workspaceRoot, member, false)
   }
 
   """

@@ -41,8 +41,8 @@ type E2e {
   way a bare `dagger check` does.
   """
   let formatCheckEverything(ws: Workspace!): Void {
-    run(deno.projects(ws).batch.formatCheck(ws))
-    run(deno.workspaces(ws).batch.formatCheck(ws))
+    deno.projects(ws).formatCheck(ws)
+    deno.workspaces(ws).formatCheck(ws)
     null
   }
 
@@ -54,8 +54,8 @@ type E2e {
   }
 
   """
-  Discovery + batches: the projects batch formatCheck fails because the
-  discovered fmt-dirty fixture is unformatted, the batch format's changeset
+  Discovery + collection helpers: the projects formatCheck helper fails because the
+  discovered fmt-dirty fixture is unformatted, the format helper's changeset
   includes it, and discovery partitions the workspace fixture (a root + members)
   apart from the standalone projects.
   """
@@ -92,19 +92,19 @@ type E2e {
     )
 
     let formatFailed = {
-      run(deno.projects(ws).batch.formatCheck(ws))
+      deno.projects(ws).formatCheck(ws)
       false
     } rescue true
-    assert(formatFailed, "batch formatCheck did not fail; discovery missed the unformatted fixture")
+    assert(formatFailed, "collection formatCheck did not fail; discovery missed the unformatted fixture")
 
-    let changes = deno.projects(ws).batch.format(ws)
+    let changes = deno.projects(ws).format(ws)
     assert(
       contains(changes.modifiedPaths, fmtDirtyPath + "/main.ts"),
-      "batch format changeset did not include the discovered fmt-dirty project",
+      "collection format changeset did not include the discovered fmt-dirty project",
     )
     assert(
-      deno.workspaces(ws).batch.format(ws).isEmpty,
-      "batch format changed the clean workspace fixture",
+      deno.workspaces(ws).format(ws).isEmpty,
+      "collection format changed the clean workspace fixture",
     )
 
     # A standalone project (no workspace ancestor) resolves its workspace root to
@@ -127,7 +127,7 @@ type E2e {
     run(workspace.lint(ws))
     run(workspace.typeCheck(ws))
     run(workspace.formatCheck(ws))
-    run(workspace.test(ws))
+    workspace.test(ws)
 
     let members = workspace.members(ws).{{path}}.map { m => m.path }
     assert(
@@ -160,20 +160,20 @@ type E2e {
     # These only pass because `add`'s container mounts the workspace root, so the
     # cross-member `@ws/util` import and shared config resolve.
     run(add.typeCheck(ws))
-    run(add.test(ws))
+    add.test(ws)
     null
   }
 
   """
   A workspace with a cross-member import, rooted directly at the discovery cwd so
-  the batches run over just this workspace. It guards the partition: the root is
+  the collection helpers run over just this workspace. It guards the partition: the root is
   the only `workspaces` key, fanned out via `deno`'s own workspace resolution,
   while its members are not `projects` keys. If a member leaked into `projects`
   it would be type-checked as a standalone project (mounting only its own
   subtree) and the cross-member `@ws/util` import would fail. Passing all three
   verbs proves both the fan-out and the partition hold.
   """
-  workspaceBatchCheck: Void @check {
+  workspacePartitionCheck: Void @check {
     let sub = directory
       .withNewFile("deno.json", "{\n  \"workspace\": [\"./add\", \"./util\"]\n}\n")
       .withNewFile("util/deno.json", "{\n  \"name\": \"@ws/util\",\n  \"exports\": \"./mod.ts\"\n}\n")
@@ -191,12 +191,12 @@ type E2e {
     assert(deno.workspaces(sub).keys == ["."], "workspace root was not the only workspaces key")
     let leaked = deno.projects(sub).keys
     assert(leaked.length == 0, "workspace members leaked into projects: " + leaked.join(", "))
-    run(deno.workspaces(sub).batch.typeCheck(sub))
-    run(deno.workspaces(sub).batch.test(sub))
-    run(deno.workspaces(sub).batch.lint(sub))
-    run(deno.projects(sub).batch.typeCheck(sub))
-    run(deno.projects(sub).batch.test(sub))
-    run(deno.projects(sub).batch.lint(sub))
+    deno.workspaces(sub).typeCheck(sub)
+    deno.workspaces(sub).test(sub)
+    deno.workspaces(sub).lint(sub)
+    deno.projects(sub).typeCheck(sub)
+    deno.projects(sub).test(sub)
+    deno.projects(sub).lint(sub)
     null
   }
 
@@ -255,9 +255,9 @@ type E2e {
 
     # Only pass if the root above the caller is what gets mounted.
     run(project.typeCheck(member))
-    run(project.test(member))
+    project.test(member)
 
-    # The batches reach the same member the same way, even though discovery
+    # The collection helpers reach the same member the same way, even though discovery
     # never sees the workspace root from here: the member is a `projects` key
     # whose item still resolves the root above the caller.
     let projects = deno.projects(member)
@@ -267,13 +267,13 @@ type E2e {
       "collection item did not resolve the workspace root above the caller: "
         + projects.get(key: "add").workspaceRoot,
     )
-    run(projects.batch.test(member))
+    projects.test(member)
 
     # The CLI applies a generator's changeset from the caller's location, so the
     # member sitting at the cwd is keyed there, not at the workspace root.
     assert(
-      contains(projects.batch.format(member).modifiedPaths, "dirty.ts"),
-      "batch format from a subdirectory did not key its changeset at the caller's location",
+      contains(projects.format(member).modifiedPaths, "dirty.ts"),
+      "collection format from a subdirectory did not key its changeset at the caller's location",
     )
     null
   }
@@ -286,7 +286,7 @@ type E2e {
     run(project.lint(ws))
     run(project.typeCheck(ws))
     run(project.formatCheck(ws))
-    run(project.test(ws))
+    project.test(ws)
     null
   }
 
@@ -343,7 +343,7 @@ type E2e {
   withDepsCheck(ws: Workspace!): Void @check {
     let project = deno.project(ws, withDepsPath)
     run(project.typeCheck(ws))
-    run(project.test(ws))
+    project.test(ws)
     null
   }
 
@@ -356,7 +356,7 @@ type E2e {
   permissionCheck(ws: Workspace!): Void @check {
     let project = deno.project(ws, permNetPath)
     # The module runs `deno test -P`, so net (declared in deno.json) is granted.
-    run(project.test(ws))
+    project.test(ws)
 
     # Without -P, deno refuses config permissions — proves -P is load-bearing.
     let withoutPermissionFlagFailed = {
@@ -377,7 +377,7 @@ type E2e {
   2.4.0 fail with "unexpected argument '-P'".
   """
   legacyVersionCheck(ws: Workspace!): Void @check {
-    run(deno(version: "2.4.0").project(ws, helloPath).test(ws))
+    deno(version: "2.4.0").project(ws, helloPath).test(ws)
     null
   }
 
@@ -417,16 +417,14 @@ type E2e {
       .withNewFile("main.ts", "const s = await Deno.permissions.query({ name: \"net\" });\nconsole.log(\"NET:\" + s.state);\n")
       .asWorkspace
     assert(
-      { run(deno.project(w, ".").test(w)); false } rescue true,
+      { deno.project(w, ".").test(w); false } rescue true,
       "config granted net to a project without permission sets",
     )
-    run(deno(permissions: "all").project(w, ".").test(w))
-    run(deno(permissions: "all").projects(w).batch.test(w))
+    deno(permissions: "all").project(w, ".").test(w)
+    deno(permissions: "all").projects(w).test(w)
     assert(
       {
-        run(
-          deno(permissions: "none").project(ws, permNetPath).test(ws),
-        )
+        deno(permissions: "none").project(ws, permNetPath).test(ws)
         false
       } rescue true,
       "none still applied the deno.json permission set",
@@ -461,8 +459,8 @@ type E2e {
         "/**\n * @example\n * ```ts\n * throw new Error(\"doc example ran\");\n * ```\n */\nexport const x = 1;\n",
       )
       .asWorkspace
-    run(deno.project(w, ".").test(w))
-    let failure = { run(deno(testArgs: ["--doc"]).project(w, ".").test(w)); "unexpected success" } rescue {
+    deno.project(w, ".").test(w)
+    let failure = { deno(testArgs: ["--doc"]).project(w, ".").test(w); "unexpected success" } rescue {
       err: Error => err.message
     }
     assert(failure.contains("exit code"), "--doc did not run the failing doc example: " + failure)
@@ -486,7 +484,7 @@ type E2e {
       "type-check of `.` missed the type error in tools/",
     )
     run(deno(typeCheckTargets: ["mod.ts"]).project(w, ".").typeCheck(w))
-    run(deno(typeCheckTargets: ["mod.ts"]).projects(w).batch.typeCheck(w))
+    deno(typeCheckTargets: ["mod.ts"]).projects(w).typeCheck(w)
     assert(
       {
         run(
@@ -521,7 +519,7 @@ type E2e {
       .withNewFile("util/mod.ts", "export function f(a:number){var b: string = a; return b}\n")
     let w = base.asWorkspace
     let add = deno.project(w, "add")
-    run(add.test(w))
+    add.test(w)
     # Control: the same tests from the member's own directory (its container's
     # workdir, where they used to run) can't find the root deno.json.
     assert(
@@ -612,7 +610,7 @@ type E2e {
     )
 
     # The genuine JSONC workspace runs under deno too.
-    run(deno.workspaces(w).subset(keys: ["plugins"]).batch.lint(w))
+    deno.workspaces(w).subset(keys: ["plugins"]).lint(w)
 
     # The file deno reads, from the accessors and from inside the workspace.
     assert(
@@ -642,7 +640,7 @@ type E2e {
   """
   subdirScopeCheck: Void @check {
     # Ancestor is skipped: dirty root, clean sub. From `/sub`, a project root, the
-    # enclosing root is not a key, so the batches pass (sub is clean).
+    # enclosing root is not a key, so the collection helpers pass (sub is clean).
     let dirtyAncestor = directory
       .withNewFile("deno.json", "{}\n")
       .withNewFile("mod.ts", "export function f(a:number){return a}\n")
@@ -663,7 +661,7 @@ type E2e {
     )
 
     # Clean root, dirty sub. From `/sub`, sub is the caller's own project, so the
-    # projects batch checks it and fails.
+    # projects formatCheck helper checks it and fails.
     let dirtySub = directory
       .withNewFile("deno.json", "{}\n")
       .withNewFile("mod.ts", "export const ok = 1;\n")
@@ -709,7 +707,7 @@ type E2e {
     )
     # ...but a changeset applies from where the caller stands, so format keeps
     # only the part of the project under it.
-    let changes = deno.projects(inside).batch.format(inside)
+    let changes = deno.projects(inside).format(inside)
     assert(
       changes.modifiedPaths == ["lib/x.ts"],
       "format from inside a project did not scope its changeset to the caller: "
@@ -770,7 +768,7 @@ type E2e {
       "inside a member's subdirectory: the whole workspace was selected too",
     )
     # Passes only if the workspace root above the caller is mounted.
-    run(projects.batch.typeCheck(inMember))
+    projects.typeCheck(inMember)
 
     let inDocs = tree.asWorkspace(cwd: "ws/docs")
     assert(deno.workspaces(inDocs).keys == ["ws"], "inside a workspace's non-member subdirectory")
@@ -781,7 +779,7 @@ type E2e {
   """
   Projects form a collection keyed by project root. get and list build the
   projects at those keys; subset keeps parent order, rejects unknown and
-  duplicate keys, and narrows what get accepts and what the batches run; an
+  duplicate keys, and narrows what get accepts and what the collection helpers run; an
   empty subset is valid and runs nothing.
   """
   projectsCollectionCheck(ws: Workspace!): Void @check {
@@ -799,11 +797,11 @@ type E2e {
     assert(pair.keys == parentOrder, "subset did not keep parent order: " + pair.keys.join(", "))
 
     # fmt-dirty is in the collection but outside the subset, so the subset's
-    # batches pass and its format changes nothing.
-    run(pair.batch.formatCheck(ws))
-    run(pair.batch.typeCheck(ws))
-    run(pair.batch.test(ws))
-    assert(pair.batch.format(ws).isEmpty, "subset format touched a project outside the subset")
+    # helpers pass and its format changes nothing.
+    pair.formatCheck(ws)
+    pair.typeCheck(ws)
+    pair.test(ws)
+    assert(pair.format(ws).isEmpty, "subset format touched a project outside the subset")
 
     let outside = { pair.get(key: fmtDirtyPath).path } rescue {
       err: Error => "rejected"
@@ -825,16 +823,16 @@ type E2e {
 
     let none = projects.subset(keys: [])
     assert(none.keys.length == 0, "empty subset kept keys: " + none.keys.join(", "))
-    run(none.batch.lint(ws))
-    assert(none.batch.format(ws).isEmpty, "empty subset formatted something")
+    none.lint(ws)
+    assert(none.format(ws).isEmpty, "empty subset formatted something")
 
     # A subset holding only the dirty project fails and formats only it.
     let dirty = projects.subset(keys: [fmtDirtyPath])
-    let failure = { run(dirty.batch.formatCheck(ws)); "unexpected success" } rescue {
+    let failure = { dirty.formatCheck(ws); "unexpected success" } rescue {
       err: Error => err.message
     }
     assert(failure.contains(fmtDirtyPath), "subset formatCheck did not name the dirty project: " + failure)
-    let changes = dirty.batch.format(ws)
+    let changes = dirty.format(ws)
     assert(
       changes.modifiedPaths == [fmtDirtyPath + "/main.ts"],
       "subset format changed more than the dirty project: " + changes.modifiedPaths.join(", "),
@@ -843,10 +841,10 @@ type E2e {
   }
 
   """
-  A batch runs every selected project even after one fails, and names each
+  A collection helper runs every selected project even after one fails, and names each
   failing project.
   """
-  batchFailuresCheck: Void @check {
+  collectionFailuresCheck: Void @check {
     let w = directory
       .withNewFile("a/deno.json", "{}\n")
       .withNewFile("a/mod.ts", "export function f(a:number){return a}\n")
@@ -857,19 +855,19 @@ type E2e {
       .asWorkspace
     let projects = deno.projects(w)
     assert(projects.keys == ["a", "b", "c"], "unexpected keys: " + projects.keys.join(", "))
-    let failure = { run(projects.batch.formatCheck(w)); "unexpected success" } rescue {
+    let failure = { projects.formatCheck(w); "unexpected success" } rescue {
       err: Error => err.message
     }
     assert(
       failure.contains("- a:") and failure.contains("- c:") and failure.contains("- b:") == false,
-      "batch formatCheck did not name exactly the failing projects: " + failure,
+      "collection formatCheck did not name exactly the failing projects: " + failure,
     )
-    let changes = projects.batch.format(w)
+    let changes = projects.format(w)
     assert(
       contains(changes.modifiedPaths, "a/mod.ts")
         and contains(changes.modifiedPaths, "c/mod.ts")
         and changes.modifiedPaths.length == 2,
-      "batch format did not produce one changeset over the dirty projects: "
+      "collection format did not produce one changeset over the dirty projects: "
         + changes.modifiedPaths.join(", "),
     )
     null
@@ -877,7 +875,7 @@ type E2e {
 
   """
   Deno workspaces form a collection keyed by workspace root, with the same get,
-  subset and batch behavior as projects.
+  subset and helper behavior as projects.
   """
   workspacesCollectionCheck(ws: Workspace!): Void @check {
     let workspaces = deno.workspaces(ws)
@@ -887,10 +885,10 @@ type E2e {
       "list did not return one workspace per key, in key order",
     )
     let one = workspaces.subset(keys: [workspacePath])
-    run(one.batch.lint(ws))
-    run(one.batch.typeCheck(ws))
-    run(one.batch.test(ws))
-    run(one.batch.formatCheck(ws))
+    one.lint(ws)
+    one.typeCheck(ws)
+    one.test(ws)
+    one.formatCheck(ws)
 
     let unknown = { workspaces.subset(keys: [helloPath]).keys.join(","); "accepted" } rescue {
       err: Error => "rejected"
@@ -898,10 +896,10 @@ type E2e {
     assert(unknown == "rejected", "workspaces subset accepted a standalone project")
 
     let none = workspaces.subset(keys: [])
-    run(none.batch.test(ws))
-    assert(none.batch.format(ws).isEmpty, "empty workspaces subset formatted something")
+    none.test(ws)
+    assert(none.format(ws).isEmpty, "empty workspaces subset formatted something")
 
-    # Two workspaces side by side: the batch runs both and names the dirty one.
+    # Two workspaces side by side: the helper runs both and names the dirty one.
     let two = directory
       .withNewFile("x/deno.json", "{\n  \"workspace\": [\"./pkg\"]\n}\n")
       .withNewFile("x/pkg/deno.json", "{\n  \"name\": \"@x/pkg\",\n  \"exports\": \"./mod.ts\"\n}\n")
@@ -913,18 +911,420 @@ type E2e {
     let pair = deno.workspaces(two)
     assert(pair.keys == ["x", "y"], "unexpected workspace keys: " + pair.keys.join(", "))
     assert(deno.projects(two).keys.length == 0, "workspace members leaked into projects")
-    let failure = { run(pair.batch.formatCheck(two)); "unexpected success" } rescue {
+    let failure = { pair.formatCheck(two); "unexpected success" } rescue {
       err: Error => err.message
     }
     assert(
       failure.contains("- y:") and failure.contains("- x:") == false,
-      "workspaces batch formatCheck did not name exactly the dirty workspace: " + failure,
+      "workspaces collection formatCheck did not name exactly the dirty workspace: " + failure,
     )
-    run(pair.subset(keys: ["x"]).batch.formatCheck(two))
+    pair.subset(keys: ["x"]).formatCheck(two)
     assert(
-      pair.batch.format(two).modifiedPaths == ["y/pkg/mod.ts"],
-      "workspaces batch format did not produce one changeset over the dirty workspace",
+      pair.format(two).modifiedPaths == ["y/pkg/mod.ts"],
+      "workspaces collection format did not produce one changeset over the dirty workspace",
     )
     null
   }
+
+  """
+  Test files are found the way `deno test` walks a directory: test.*, *_test.*
+  and *.test.* with a JavaScript or TypeScript extension, hidden directories
+  included, node_modules and the config's `exclude`, `test.exclude` and
+  `test.include` followed. A standalone project leaves a nested project's files
+  to it; a workspace covers its members, minus what their configs exclude.
+  """
+  testFilesDiscoveryCheck: Void @check {
+    let ok = "Deno.test(\"ok\", () => {});\n"
+    let w = directory
+      .withNewFile(
+        "app/deno.json",
+        "{\n  \"exclude\": [\"dist\"],\n  \"test\": { \"exclude\": [\"e2e/\", \"**/*.slow_test.ts\"] }\n}\n",
+      )
+      .withNewFile("app/a_test.ts", ok)
+      .withNewFile("app/b.test.mjs", ok)
+      .withNewFile("app/test.tsx", ok)
+      .withNewFile("app/.hidden/h_test.ts", ok)
+      .withNewFile("app/lib/helper.ts", "export const helper = 1;\n")
+      # Test-named files that register no test of their own are no checks.
+      .withNewFile("app/empty_test.ts", "export {};\n")
+      .withNewFile("app/imports_test.ts", "import \"./lib/helper.ts\";\n")
+      .withNewFile("app/foo.spec.ts", failingTest("a spec file"))
+      .withNewFile("app/latest.ts", "export const latest = 1;\n")
+      .withNewFile("app/dist/x_test.ts", failingTest("an excluded file"))
+      .withNewFile("app/e2e/y_test.ts", failingTest("a test-excluded file"))
+      .withNewFile("app/sub/z.slow_test.ts", failingTest("a glob-excluded file"))
+      .withNewFile("app/node_modules/pkg/n_test.ts", failingTest("a node_modules file"))
+      .withNewFile("app/nested/deno.json", "{}\n")
+      .withNewFile("app/nested/n_test.ts", failingTest("a nested project's test"))
+      .withNewFile("inc/deno.json", "{\n  \"test\": { \"include\": [\"src/\"] }\n}\n")
+      .withNewFile("inc/src/s_test.ts", ok)
+      .withNewFile("inc/other_test.ts", failingTest("a file outside test.include"))
+      .withNewFile("mono/deno.json", "{\n  \"workspace\": [\"./a\"]\n}\n")
+      .withNewFile(
+        "mono/a/deno.json",
+        "{\n  \"name\": \"@m/a\",\n  \"exports\": \"./mod.ts\",\n  \"test\": { \"exclude\": [\"skip_test.ts\"] }\n}\n",
+      )
+      .withNewFile("mono/a/mod.ts", "export const a = 1;\n")
+      .withNewFile("mono/a/a_test.ts", ok)
+      .withNewFile("mono/a/skip_test.ts", failingTest("a member-excluded file"))
+      .withNewFile("mono/root_test.ts", ok)
+      .asWorkspace
+    let app = deno.project(w, "app").testFiles(w)
+    assert(
+      app.keys == ["app/.hidden/h_test.ts", "app/a_test.ts", "app/b.test.mjs", "app/test.tsx"],
+      "app test files: " + app.keys.join(", "),
+    )
+    let nested = deno.project(w, "app/nested").testFiles(w).keys
+    assert(nested == ["app/nested/n_test.ts"], "nested project test files: " + nested.join(", "))
+    let inc = deno.project(w, "inc").testFiles(w).keys
+    assert(inc == ["inc/src/s_test.ts"], "test.include: " + inc.join(", "))
+    let mono = deno.workspace(w, "mono").testFiles(w)
+    assert(mono.keys == ["mono/a/a_test.ts", "mono/root_test.ts"], "workspace test files: " + mono.keys.join(", "))
+    let member = deno.project(w, "mono/a").testFiles(w).keys
+    assert(member == ["mono/a/a_test.ts"], "member test files: " + member.join(", "))
+    assert(app.get(key: "app/a_test.ts").path == "app/a_test.ts", "get did not return the file at its key")
+
+    # The plain helpers run the discovered files and nothing else.
+    app.test(w)
+    mono.test(w)
+    deno.project(w, "inc").testFiles(w).test(w)
+    null
+  }
+
+  """
+  The collection's plain `test` helper runs its files in one `deno test` and
+  names exactly the files that failed; a subset runs only its own.
+  """
+  testFilesHelperCheck: Void @check {
+    let w = directory
+      .withNewFile("deno.json", "{}\n")
+      .withNewFile("a_test.ts", "Deno.test(\"a\", () => {});\n")
+      .withNewFile("b_test.ts", "Deno.test(\"b\", () => { throw new Error(\"b failed on purpose\"); });\n")
+      .withNewFile("c_test.ts", "Deno.test(\"c\", () => {});\n")
+      .asWorkspace
+    let files = deno.project(w, ".").testFiles(w)
+    let failure = { files.test(w); "unexpected success" } rescue {
+      err: Error => err.message
+    }
+    assert(
+      failure.contains("- b_test.ts:")
+        and failure.contains("b failed on purpose")
+        and failure.contains("- a_test.ts:") == false
+        and failure.contains("- c_test.ts:") == false,
+      "test helper did not name exactly the failing file: " + failure,
+    )
+    files.subset(keys: ["a_test.ts", "c_test.ts"]).test(w)
+    null
+  }
+
+  """
+  The test report indexer's own unit tests.
+  """
+  testReportIndexerCheck(ws: Workspace!): Void @check {
+    container
+      .from("denoland/deno:alpine-2.9.3")
+      .withoutEntrypoint
+      .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
+      .withDirectory("/src", ws.directory("/helpers/deno-test-report"))
+      .withWorkdir("/src")
+      .withExec(["deno", "test", "--no-config", "--no-lock", "--no-remote", "main_test.ts"])
+      .withExec(["deno", "lint", "--no-config", "main.ts", "main_test.ts"])
+      .withExec(["deno", "fmt", "--check", "--no-config", "main.ts", "main_test.ts"])
+      .sync
+    null
+  }
+
+  # A test file whose test fails, saying what ran.
+  let failingTest(what: String!): String! {
+    "Deno.test(\"x\", () => { throw new Error(\"" + what + " ran\"); });\n"
+  }
+
+  # Only the unindented CHECKS header counts: nested test summaries can be
+  # right while Dagger attributes the checks wrongly.
+  let checkSummaryMatches(output: String!, passed: Int!, failed: Int!): Boolean! {
+    let headers = output.split("\n").filter { line =>
+      line.hasPrefix("CHECKS ") or line.hasPrefix("== CHECKS ==")
+    }
+    let expected = (if (failed > 0) { ["✘", `${failed}`, "failed"] } else { [] })
+      + (if (passed > 0) { ["✔", `${passed}`, "passed"] } else { [] })
+    headers.length == 1 and headers[0]!
+      .trimPrefix("== ")
+      .trimPrefix("CHECKS")
+      .trimPrefix(" ==")
+      .trimSpace
+      .split(" ")
+      .filter { word => word != "" } == expected
+  }
+
+  # `dagger check` in a fixture with this module installed, through the
+  # engine-provided CLI in a session of its own. Direct Dang calls do not apply
+  # the engine's filtered collection view; only the CLI does.
+  let daggerCheck(
+    ws: Workspace!,
+    fixture: Directory!,
+    args: [String!]!,
+    settings: String! = "",
+  ): Container! {
+    container
+      .from("alpine:3.23")
+      # Workspace.search runs ripgrep on the client, which here is this
+      # container: discovery searches for configs declaring a workspace.
+      .withExec(["apk", "add", "--no-cache", "ripgrep"])
+      .withEnvVariable("NO_COLOR", "1")
+      .withDirectory(
+        "/source",
+        ws.directory("/", exclude: [".git", ".dagger/modules/e2e/modules"]),
+      )
+      .withDirectory("/work", fixture)
+      .withNewFile("/work/.git/HEAD", "ref: refs/heads/main\n")
+      .withNewFile("/work/dagger.toml", "[modules.deno]\nsource = \"/source\"\n" + settings)
+      .withWorkdir("/work")
+      .withExec(["/dev/.dagger/dagger"] + args, expect: ANY, daggerInDaggerNewSession: true)
+  }
+
+  let selectedCheck(
+    ws: Workspace!,
+    fixture: Directory!,
+    args: [String!]!,
+    passed: Int!,
+    failed: Int! = 0,
+    messages: [String!]! = [],
+    settings: String! = "",
+  ): Void {
+    let result = daggerCheck(
+      ws,
+      fixture,
+      ["--progress=report", "check", "--generated=false"] + args,
+      settings: settings,
+    )
+    let output = result.stdout + result.stderr
+    assert((result.exitCode == 0) == (failed == 0), "unexpected check exit status:\n" + output)
+    assert(checkSummaryMatches(output, passed, failed), "unexpected Dagger check totals:\n" + output)
+    messages.map { message =>
+      assert(output.contains(message), "missing " + message + ":\n" + output)
+    }
+    null
+  }
+
+  let selectionOk: String! = "Deno.test(\"ok\", () => {});\n"
+  let selectionExcluded: String! = "Deno.test(\"other\", () => { throw new Error(\"excluded test ran\"); });\n"
+
+  # Two standalone projects and a workspace, each with two test files to
+  # select and one whose test fails if it runs.
+  let selectionFixture: Directory! {
+    ["p1", "p2"].reduce(
+      directory
+        .withNewFile("ws/deno.json", "{\n  \"workspace\": [\"./m\"]\n}\n")
+        .withNewFile("ws/m/deno.json", "{\n  \"name\": \"@w/m\",\n  \"exports\": \"./mod.ts\"\n}\n")
+        .withNewFile("ws/m/mod.ts", "export const m = 1;\n")
+        .withNewFile("ws/m/a_test.ts", selectionOk)
+        .withNewFile("ws/m/b_test.ts", selectionOk)
+        .withNewFile("ws/m/other_test.ts", selectionExcluded),
+    ) { fixture, p =>
+      fixture
+        .withNewFile(p + "/deno.json", "{}\n")
+        .withNewFile(p + "/a_test.ts", selectionOk)
+        .withNewFile(p + "/b_test.ts", selectionOk)
+        .withNewFile(p + "/other_test.ts", selectionExcluded)
+    }
+  }
+
+  let projectSelection: [String!]! {
+    ["p1/a_test.ts", "p1/b_test.ts", "p2/a_test.ts", "p2/b_test.ts"].map { f => "--deno-projects-test-file=" + f }
+  }
+
+  """
+  Selected test files in two projects pass, and the excluded ones never run.
+  """
+  selectedTestsCheck(ws: Workspace!): Void @check {
+    selectedCheck(ws, selectionFixture, projectSelection, passed: 4)
+  }
+
+  """
+  Selected test files in a workspace's member pass, and the excluded one never runs.
+  """
+  selectedWorkspaceTestsCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      selectionFixture,
+      ["--deno-workspaces-test-file=ws/m/a_test.ts", "--deno-workspaces-test-file=ws/m/b_test.ts"],
+      passed: 2,
+    )
+  }
+
+  """
+  Every selected file of a project shares one `deno test`: four checks in two
+  projects run two, and an unnarrowed project runs without file arguments.
+  """
+  selectedSharedRunCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture
+      .withoutFile("p2/other_test.ts")
+      # Unique content, so that this check's runs are not cached by another's.
+      .withNewFile("p1/marker_test.ts", "// shared run check\n" + selectionOk)
+    let args = projectSelection + ["--deno-projects-test-file=p1/marker_test.ts"]
+    let result = daggerCheck(ws, fixture, ["-vvv", "--progress=plain", "check", "--generated=false"] + args)
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "the selected checks failed:\n" + output)
+    let runs = output.split("\n").filter { line => line.contains("withExec deno test --permit-no-files") and line.contains("DONE") == false }
+    assert(runs.length == 2, "expected one deno test per project, got:\n" + runs.join("\n"))
+    assert(
+      runs.any { line => line.contains("./a_test.ts ./b_test.ts ./marker_test.ts") },
+      "the narrowed project did not pass its selected files:\n" + runs.join("\n"),
+    )
+    assert(
+      runs.any { line => line.contains("--junit-path=/deno-test/report.xml (") },
+      "the unnarrowed project did not run as a whole:\n" + runs.join("\n"),
+    )
+    null
+  }
+
+  """
+  A failing test fails only its own file's check.
+  """
+  selectedFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "p1/a_test.ts",
+      "Deno.test(\"broken\", () => { throw new Error(\"selected failure\"); });\n",
+    )
+    selectedCheck(ws, fixture, projectSelection, passed: 3, failed: 1, messages: ["selected failure"])
+  }
+
+  """
+  A type error stops `deno test` before any test runs, so it fails every
+  selected file of that project, and only that project.
+  """
+  selectedTypeErrorCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "p2/a_test.ts",
+      "const n: number = \"not a number\";\nDeno.test(\"typed\", () => {});\n",
+    )
+    selectedCheck(ws, fixture, projectSelection, passed: 2, failed: 2, messages: ["TS2322"])
+  }
+
+  """
+  A module that throws outside any test fails only its own file's check.
+  """
+  selectedUncaughtCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "p1/b_test.ts",
+      "Deno.test(\"registered\", () => {});\nthrow new Error(\"top-level failure\");\n",
+    )
+    selectedCheck(ws, fixture, projectSelection, passed: 3, failed: 1, messages: ["top-level failure"])
+  }
+
+  """
+  A failing test an imported helper registers is reported in the helper, but
+  fails only the check of the test file that ran it.
+  """
+  selectedHelperFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture
+      .withNewFile("p1/helper.ts", "Deno.test(\"shared\", () => { throw new Error(\"helper failure\"); });\n")
+      .withNewFile("p1/a_test.ts", "import \"./helper.ts\";\n" + selectionOk)
+    selectedCheck(
+      ws,
+      fixture,
+      projectSelection,
+      passed: 3,
+      failed: 1,
+      messages: ["shared (registered in ./helper.ts)", "helper failure"],
+    )
+  }
+
+  """
+  With --parallel in testArgs, deno prints no module headers: a file whose
+  only test comes from a helper still counts as run, from the prefix on that
+  test's line, and a test-named file that registers no test is no check.
+  """
+  selectedParallelCheck(ws: Workspace!): Void @check {
+    let fixture = directory
+      .withNewFile("p/deno.json", "{}\n")
+      .withNewFile("p/a_test.ts", selectionOk)
+      .withNewFile("p/helper.ts", "Deno.test(\"from helper\", () => {});\n")
+      .withNewFile("p/b_test.ts", "// Its Deno.test comes from the helper.\nimport \"./helper.ts\";\n")
+      .withNewFile("p/empty_test.ts", "export {};\n")
+    selectedCheck(
+      ws,
+      fixture,
+      ["--deno-projects-test-files"],
+      passed: 2,
+      settings: "\n[modules.deno.settings]\ntestArgs = [\"--parallel\"]\n",
+    )
+  }
+
+  """
+  A project whose config deno can't parse fails its own test files' checks,
+  with deno's error naming the file; the other project's pass.
+  """
+  selectedBrokenConfigCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      selectionFixture.withNewFile("p2/deno.json", "{ broken\n"),
+      projectSelection,
+      passed: 2,
+      failed: 2,
+      messages: ["p2/deno.json"],
+    )
+  }
+
+  """
+  Listing test files runs no deno and no test: a testArgs that breaks every
+  run still lists every file.
+  """
+  listingRunsNoToolCheck(ws: Workspace!): Void @check {
+    let result = daggerCheck(
+      ws,
+      selectionFixture,
+      ["-vvv", "--progress=plain", "check", "-l", "--all", "-f=cli"],
+      settings: "\n[modules.deno.settings]\ntestArgs = [\"--not-a-deno-flag\"]\n",
+    )
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "listing failed:\n" + output)
+    ["--deno-projects-test-file=p1/a_test.ts", "--deno-projects-test-file=p2/other_test.ts", "--deno-workspaces-test-file=ws/m/b_test.ts"].map { key =>
+      assert(output.contains(key), "listing missed " + key + ":\n" + output)
+    }
+    let execs = output.split("\n").filter { line => line.contains("withExec deno") or line.contains("exec deno ") }
+    assert(execs.length == 0, "listing ran deno:\n" + execs.join("\n"))
+    null
+  }
+
+
+  """
+  An unnarrowed project runs as a whole, so a failing test file deno runs but
+  discovery does not list (one `test.include` names) fails its checks; a
+  narrowed selection leaves it out.
+  """
+  selectedWholeRunCheck(ws: Workspace!): Void @check {
+    let fixture = directory
+      .withNewFile("p/deno.json", "{\n  \"test\": { \"include\": [\"a_test.ts\", \"b_test.ts\", \"extra.ts\"] }\n}\n")
+      .withNewFile("p/a_test.ts", selectionOk)
+      .withNewFile("p/b_test.ts", selectionOk)
+      .withNewFile("p/extra.ts", "Deno.test(\"extra\", () => { throw new Error(\"undiscovered failure\"); });\n")
+    selectedCheck(
+      ws,
+      fixture,
+      ["--deno-projects-test-files"],
+      passed: 0,
+      failed: 2,
+      messages: ["failures outside the selected test files: ./extra.ts", "undiscovered failure"],
+    )
+    selectedCheck(ws, fixture, ["--deno-projects-test-file=p/a_test.ts"], passed: 1)
+  }
+
+  """
+  A selected file that deno never runs fails, saying so, rather than passing
+  with nothing behind it.
+  """
+  selectedNotRunCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      selectionFixture.withNewFile("p1/slow/c_test.ts", selectionOk),
+      projectSelection + ["--deno-projects-test-file=p1/slow/c_test.ts"],
+      passed: 4,
+      failed: 1,
+      messages: ["./slow/c_test.ts did not run"],
+      # deno skips an ignored directory even below a file argument.
+      settings: "\n[modules.deno.settings]\ntestArgs = [\"--ignore=slow\"]\n",
+    )
+  }
+
 }
