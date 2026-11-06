@@ -170,6 +170,239 @@ type Deno {
   }
 
   """
+  A container that runs the test report indexer, pinned apart from `version`
+  and `base` so that every project's report is read by the same program.
+  """
+  let reportIndexer: Container! {
+    container
+      .from("denoland/deno:alpine-2.9.3")
+      .withoutEntrypoint
+      .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
+      .withEnvVariable("NO_COLOR", "1")
+      .withFile("/indexer/main.ts", currentModule.source.file("helpers/deno-test-report/main.ts"))
+  }
+
+  """
+  The test files `deno test` runs from `root` when given `member` ("" for all
+  of root): files named test.*, *_test.* or *.test.* with a JavaScript or
+  TypeScript extension, outside node_modules and what the configs exclude.
+  Directories below the scope with a config of their own are members of a
+  `workspace`, whose configs' excludes apply; otherwise they are projects of
+  their own, whose files are theirs. Listing runs no container.
+  """
+  let testFiles(
+    ws: Workspace!,
+    root: String!,
+    member: String!,
+    workspace: Boolean!,
+  ): DenoTestFiles! {
+    let scope = joinPath(root, member)
+    let empty: [String!]! = []
+    let configs = ws.directory(
+      absolutePath(scope),
+      include: ["**/deno.json", "**/deno.jsonc"],
+      exclude: [".git", "**/node_modules"],
+    )
+    let configFiles = configs.glob("**/deno.json") + configs.glob("**/deno.jsonc")
+    let dirs = configFiles.map { f => configDirOf(f) }.uniq
+    let nested = dirs.filter { d => d != "." }
+    let read = if (workspace) { dirs } else { dirs.filter { d => d == "." } }
+    let excluded = read.reduce(empty) { all, d =>
+      all + excludePatterns(configText(configs, configFiles, d)).map { p => joinPath(
+        d,
+        p,
+      ) }
+    } + (if (workspace) { empty } else { nested })
+    let included = if (dirs.contains(".")) {
+      includePatterns(configText(configs, configFiles, "."))
+    } else {
+      empty
+    }
+    let found = ws
+      .directory(
+        absolutePath(scope),
+        include: ["**/test.*", "**/*_test.*", "**/*.test.*"],
+        exclude: [".git", "**/node_modules"],
+      )
+      .glob("**/*test.*")
+      .filter { f =>
+        isTestFile(f)
+          and excluded.any { p => pathMatches(f, p) } == false
+          and (included.length == 0 or included.any { p => pathMatches(f, p) })
+      }
+    # A test file that registers no test of its own (an empty placeholder, one
+    # that only imports tests) is no check, as go leaves out test files that
+    # declare no test: deno would run it with nothing to report. One ripgrep
+    # pass over the scope; should the search fail, every candidate stays and
+    # the run reports what deno did with it.
+    let registering = {
+      ws
+        .search(
+          # Deno.test, and it/test/describe(.only|.skip|.ignore) as
+          # @std/testing/bdd and node:test register them. Over-matching only
+          # keeps a file.
+          pattern: `Deno\.test|(it|test|describe)(\.[a-z]+)? *\(`,
+          filesOnly: true,
+          paths: [scope],
+          globs: ["*test.*", "!**/node_modules", "!**/.git"],
+        ).{{filePath}}
+        .map { r => r.filePath.trimPrefix("/").trimPrefix("./") }
+    } rescue ["*"]
+    let declared = found.filter { f =>
+      registering == ["*"] or registering.contains(joinPath(scope, f))
+    }
+    DenoTestFiles(
+      paths: sorted(declared.map { f => joinPath(scope, f) }),
+      root: root,
+      member: member,
+      holdsProjects: workspace == false and nested.length > 0,
+      tool: self,
+    )
+  }
+
+  """
+  The config deno reads in `dir` of `configs`, which holds `files`: deno.json
+  first, falling back to deno.jsonc.
+  """
+  let configText(configs: Directory!, files: [String!]!, dir: String!): String! {
+    let json = joinPath(dir, "deno.json")
+    # A config that can't be read adds no patterns: deno's own error, naming
+    # the file, then fails that project's checks and no other's.
+    let text = {
+      configs.file(if (files.contains(json)) { json } else { joinPath(dir, "deno.jsonc") }).contents
+    } rescue "{}"
+    text
+  }
+
+  """
+  Whether a path names a file `deno test` runs when it walks a directory.
+  """
+  let isTestFile(path: String!): Boolean! {
+    path.replaceMatches(
+      `^(?:.*/)?(?:[^/]*[._])?test\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$`,
+      with: "",
+    ) == ""
+  }
+
+  """
+  The `exclude` and `test.exclude` patterns in config text, relative to its
+  directory. Negations and patterns reaching outside it are left out.
+  """
+  let excludePatterns(text: String!): [String!]! {
+    let empty: [String!]! = []
+    let patterns = {
+      let cfg: DenoConfig! = JSON.decode(stripJsonc(text))
+      cfg.exclude + (if (cfg.test == null) { empty } else { cfg.test!.exclude })
+    } rescue empty
+    patterns.map { p => normalizePattern(p) }.filter { p => p != "" }
+  }
+
+  """
+  The `test.include` patterns in config text, relative to its directory.
+  """
+  let includePatterns(text: String!): [String!]! {
+    let empty: [String!]! = []
+    let patterns = {
+      let cfg: DenoConfig! = JSON.decode(stripJsonc(text))
+      if (cfg.test == null) { empty } else { cfg.test!.include }
+    } rescue empty
+    patterns.map { p => normalizePattern(p) }.filter { p => p != "" }
+  }
+
+  """
+  A config path pattern relative to its directory, or "" when it is one this
+  module does not follow (a negation, or a path outside the directory).
+  """
+  let normalizePattern(pattern: String!): String! {
+    let p = pattern.trimPrefix("./").trimSuffix("/")
+    if (p == "" or p == "." or p.hasPrefix("!") or p.hasPrefix("/") or p.hasPrefix("..")) { "" } else { p }
+  }
+
+  """
+  Whether a path is, or is below, what a config path or glob names.
+  """
+  let pathMatches(path: String!, pattern: String!): Boolean! {
+    if (pattern.replaceMatches(`[*?\[{]`, with: "") == pattern) {
+      path == pattern or path.hasPrefix(pattern + "/")
+    } else {
+      # A pattern that is no valid glob matches nothing, as deno would refuse it.
+      { path.match(Regexp("^(?:" + globRegex(pattern) + ")(?:/.*)?$")) != null } rescue false
+    }
+  }
+
+  """
+  A glob as a regular expression: `**` crosses directories, `*` and `?` do
+  not, and `{a,b}` is either.
+  """
+  let globRegex(glob: String!): String! {
+    glob.rewriteMatches(`\*\*/|\*\*|\*|\?|\{|\}|,|[.+^$()|\\]`) { m =>
+      let t = m.string
+      if (t == "**/") {
+        "(?:.*/)?"
+      } else if (t == "**") {
+        ".*"
+      } else if (t == "*") {
+        "[^/]*"
+      } else if (t == "?") {
+        "[^/]"
+      } else if (t == "{") {
+        "(?:"
+      } else if (t == "}") {
+        ")"
+      } else if (t == ",") {
+        "|"
+      } else {
+        "\\" + t
+      }
+    }
+  }
+
+  """
+  Two workspace-relative paths joined, "." standing for the root.
+  """
+  let joinPath(dir: String!, rel: String!): String! {
+    if (rel == "" or rel == ".") { dir } else if (dir == "" or dir == ".") { rel } else { dir + "/" + rel }
+  }
+
+  """
+  A workspace-relative path as Workspace.directory takes it.
+  """
+  let absolutePath(path: String!): String! {
+    if (path == "." or path == "") { "/" } else { "/" + path }
+  }
+
+  """
+  Byte-order sort: a merge sort, n log n comparisons.
+  """
+  let sorted(items: [String!]!): [String!]! {
+    if (items.length < 2) {
+      items
+    } else {
+      let half = items.length / 2
+      mergeSorted(sorted(items.takeFirst(half)), sorted(items.dropFirst(half)))
+    }
+  }
+
+  """
+  Two byte-ordered lists merged into one.
+  """
+  let mergeSorted(a: [String!]!, b: [String!]!): [String!]! {
+    let i = 0
+    let j = 0
+    (a + b).map { unused =>
+      if (j == b.length or (i < a.length and a[i]! <= b[j]!)) {
+        let item = a[i]!
+        i += 1
+        item
+      } else {
+        let item = b[j]!
+        j += 1
+        item
+      }
+    }
+  }
+
+  """
   A container with the Deno toolchain and cache, and `dir` of the workspace
   mounted at /src as the workdir.
   """
@@ -560,37 +793,40 @@ type DenoProjects @collection {
   }
 
   """
-  Lint the selected Deno projects.
+  Lint the selected Deno projects. A plain helper, not a check: `dagger check` runs
+  each item's own `lint`.
   """
-  lint(ws: Workspace!): Void @check {
+  lint(ws: Workspace!): Void {
     runAll(ws, "lint")
   }
 
   """
-  Run tests in the selected Deno projects.
+  Run tests in the selected Deno projects, one whole `deno test` each. A plain
+  helper, not a check: `dagger check` runs one check per test file.
   """
-  test(ws: Workspace!): Void @check {
+  test(ws: Workspace!): Void {
     runAll(ws, "test")
   }
 
   """
-  Type-check the selected Deno projects.
+  Type-check the selected Deno projects. A plain helper, not a check.
   """
-  typeCheck(ws: Workspace!): Void @check {
+  typeCheck(ws: Workspace!): Void {
     runAll(ws, "typeCheck")
   }
 
   """
-  Check formatting of the selected Deno projects.
+  Check formatting of the selected Deno projects. A plain helper, not a check.
   """
-  formatCheck(ws: Workspace!): Void @check {
+  formatCheck(ws: Workspace!): Void {
     runAll(ws, "formatCheck")
   }
 
   """
-  Format the selected Deno projects.
+  Format the selected Deno projects as one changeset. A plain helper, not a
+  generator: `dagger generate` runs each item's own `format`.
   """
-  format(ws: Workspace!): Changeset! @generate {
+  format(ws: Workspace!): Changeset! {
     let items = paths.map { p => project(p) }
     let before = items.reduce(directory) { acc, p =>
       acc.withDirectory(".", p.scoped(ws, p.source(ws)))
@@ -637,37 +873,40 @@ type DenoWorkspaces @collection {
   }
 
   """
-  Lint the selected Deno workspaces.
+  Lint the selected Deno workspaces. A plain helper, not a check: `dagger check` runs
+  each item's own `lint`.
   """
-  lint(ws: Workspace!): Void @check {
+  lint(ws: Workspace!): Void {
     runAll(ws, "lint")
   }
 
   """
-  Run tests in the selected Deno workspaces.
+  Run tests in the selected Deno workspaces, one whole `deno test` each. A plain
+  helper, not a check: `dagger check` runs one check per test file.
   """
-  test(ws: Workspace!): Void @check {
+  test(ws: Workspace!): Void {
     runAll(ws, "test")
   }
 
   """
-  Type-check the selected Deno workspaces.
+  Type-check the selected Deno workspaces. A plain helper, not a check.
   """
-  typeCheck(ws: Workspace!): Void @check {
+  typeCheck(ws: Workspace!): Void {
     runAll(ws, "typeCheck")
   }
 
   """
-  Check formatting of the selected Deno workspaces.
+  Check formatting of the selected Deno workspaces. A plain helper, not a check.
   """
-  formatCheck(ws: Workspace!): Void @check {
+  formatCheck(ws: Workspace!): Void {
     runAll(ws, "formatCheck")
   }
 
   """
-  Format the selected Deno workspaces.
+  Format the selected Deno workspaces as one changeset. A plain helper, not a
+  generator: `dagger generate` runs each item's own `format`.
   """
-  format(ws: Workspace!): Changeset! @generate {
+  format(ws: Workspace!): Changeset! {
     let items = paths.map { p => workspace(p) }
     let before = items.reduce(directory) { acc, w =>
       acc.withDirectory(".", w.scoped(ws, w.source(ws)))
@@ -694,9 +933,196 @@ type DenoWorkspaces @collection {
 }
 
 """
-Partial view of a deno.json / deno.jsonc used for workspace discovery: only the
-`workspace` array (the list of monorepo member paths) is decoded.
+Test files in one Deno project or workspace, keyed by workspace-relative path.
+All of them run in one `deno test`: the project or workspace owns the config,
+the lockfile and the container, so it is the unit two runs can never share.
+"""
+type DenoTestFiles @collection {
+  """
+  Test file paths, relative to the workspace root, in byte order.
+  """
+  paths: [String!]! @keys
+
+  """
+  Test files selected in or out since the collection was discovered.
+  """
+  delta: CollectionDelta @delta
+
+  """
+  Whether the active selection removed test files from this collection.
+  """
+  narrowed: Boolean! { delta == null or delta!.removedKeys.length > 0 }
+
+  # The directory `deno test` runs from: the project's, or for a workspace
+  # member its workspace root's.
+  let root: String!
+
+  # What a whole run passes `deno test`: the member's directory relative to
+  # root, or "" for everything below root.
+  let member: String!
+
+  # Whether directories below the scope hold projects of their own. A run
+  # without file arguments would run their tests too, under this project's
+  # config, and `--ignore` would replace the config's `exclude`.
+  let holdsProjects: Boolean!
+
+  let tool: Deno!
+
+  """
+  The test file at this path.
+  """
+  file(path: String!): DenoTestFile! @get {
+    DenoTestFile(path: path)
+  }
+
+  """
+  Run the selected test files in one `deno test`, then report each failing
+  file. A plain helper, not a check: `dagger check` runs one check per file.
+  """
+  test(ws: Workspace!): Void {
+    if (paths.length > 0) {
+      let run = results(ws)
+      let failures = paths
+        .map { p => {{path: p, failure: run.failure(p)}} }
+        .filter { result => result.failure != "" }
+      if (failures.length > 0) {
+        raise "Deno tests failed:\n" + failures.map { result =>
+          "- " + result.path + ": " + result.failure
+        }.join("\n")
+      }
+    }
+    null
+  }
+
+  """
+  One `deno test` and its indexed report, shared by every selected test file.
+  It depends only on the filtered collection, never on the file asking, so
+  every check in a project builds the same command and the engine runs it once.
+  """
+  let results(ws: Workspace!): DenoTestResults! {
+    if (paths.length == 0) { raise "no Deno test files selected in " + root }
+    let files = paths.map { p => relativeTo(root, p) }
+    # With nothing selected out, run the project the way its own CI would and
+    # let deno find its tests; a failure discovery missed still fails a check.
+    # Otherwise pass the selected files, which are already in byte order.
+    let empty: [String!]! = []
+    let targets = if (narrowed or holdsProjects) {
+      files.map { f => "./" + f }
+    } else if (member == "") {
+      empty
+    } else {
+      [member]
+    }
+    let executed = tool
+      .mounted(ws, root)
+      .withEnvVariable("NO_COLOR", "1")
+      # A test that uses a Dagger SDK opens its own session; see DenoProject.exec.
+      .withEnvVariable("_EXPERIMENTAL_DAGGER_CLI_BIN", "/dev/.dagger/dagger")
+      # 511 == 0o777: a base that runs as another user can still write the report.
+      .withDirectory("/", directory.withNewDirectory("deno-test", permissions: 511))
+      .withExec(
+        ["deno", "test", "--permit-no-files"]
+          + tool.permissionFlags(false)
+          + tool.testArgs
+          + ["--junit-path=/deno-test/report.xml"]
+          + targets,
+        # A failing test is a result, not an error: raising here would fail
+        # every check the same way and lose which file failed.
+        expect: ANY,
+        redirectStdout: "/deno-test/stdout.log",
+        redirectStderr: "/deno-test/stderr.log",
+        daggerInDaggerNewSession: true,
+      )
+    let failFast = tool.testArgs.any { a => a == "--fail-fast" or a.hasPrefix("--fail-fast=") }
+    let indexed = tool
+      .reportIndexer
+      .withDirectory("/deno-test", executed.directory("/deno-test"))
+      .withNewFile(
+        "/deno-test-selection.json",
+        JSON.encode(
+          paths.map { p => {{key: p, file: "./" + relativeTo(root, p)}} },
+        ),
+      )
+      .withExec([
+        "deno", "run", "--no-config", "--no-lock", "--no-remote", "--allow-read", "--allow-write",
+        "/indexer/main.ts",
+        "--report", "/deno-test/report.xml",
+        "--stdout", "/deno-test/stdout.log",
+        "--stderr", "/deno-test/stderr.log",
+        "--selection", "/deno-test-selection.json",
+        "--exit-code", `${executed.exitCode}`,
+        "--fail-fast", if (failFast) { "true" } else { "false" },
+        "--output", "/deno-test-results",
+      ])
+    DenoTestResults(results: indexed.directory("/deno-test-results"), paths: paths)
+  }
+
+  """
+  A workspace-relative path below root, relative to root.
+  """
+  let relativeTo(dir: String!, path: String!): String! {
+    if (dir == ".") { path } else { path.trimPrefix(dir + "/") }
+  }
+}
+
+"""
+A Deno test file.
+"""
+type DenoTestFile {
+  """
+  Test file path, relative to the workspace root.
+  """
+  path: String!
+
+  """
+  Run this test file with `deno test`.
+
+  Every selected file of a project shares one run: `selection` is the
+  project's test files as the active selection filtered them, which
+  `dagger check` supplies.
+  """
+  test(ws: Workspace!, selection: DenoTestFiles!): Void @check {
+    selection.results(ws).assertPassed(path)
+  }
+}
+
+# The indexer keeps each result small, however large the report.
+type DenoTestResults {
+  let results: Directory!
+  let paths: [String!]!
+
+  """
+  Why a selected test file failed, or "" when it passed.
+  """
+  let failure(path: String!): String! {
+    if (paths.contains(path) == false) { raise "Deno test file is outside the test selection: " + path }
+    # The indexer names results by rank in the selection, which is in byte
+    # order, so paths never become file names.
+    let rank = paths.filter { p => p < path }.length
+    results.file(`${rank}`).contents
+  }
+
+  let assertPassed(path: String!): Void {
+    let failure = failure(path)
+    if (failure != "") { raise "Deno tests in " + path + ": " + failure }
+    null
+  }
+}
+
+"""
+Partial view of a deno.json / deno.jsonc: the `workspace` array (the list of
+monorepo member paths) for discovery, and what it excludes from `deno test`.
 """
 type DenoConfig {
   workspace: [String!]! = []
+  exclude: [String!]! = []
+  test: DenoTestConfig
+}
+
+"""
+The `test` section of a deno.json / deno.jsonc.
+"""
+type DenoTestConfig {
+  include: [String!]! = []
+  exclude: [String!]! = []
 }

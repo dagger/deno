@@ -23,9 +23,11 @@ get:
   (a root `deno.json` with a `workspace` array) is a first-class object: checks
   fan out across every member, and a single member's checks still resolve the
   shared lockfile, import map, and sibling packages.
-- **Selectable** — projects and workspaces are Dagger collections, so you can
-  list them and run checks on just the ones you name
-  (`--deno-project=apps/api`).
+- **Selectable** — projects, workspaces and their test files are Dagger
+  collections, so you can list them and run checks on just the ones you name
+  (`--deno-project=apps/api`, `--deno-projects-test-file=apps/api/main_test.ts`).
+  Each test file is its own check, and every selected file of a project still
+  runs in one `deno test`.
 - **Composability** — install Deno into any container, produce standalone
   binaries, and extend it from your own module.
 
@@ -33,7 +35,8 @@ See [`designs/deno-module.md`](./designs/deno-module.md) for the full design.
 
 ## Requirements
 
-Requires Dagger **v1.0.0-beta.15** or later.
+Requires Dagger **v1.0.0-beta.22** or later (selected collection arguments on
+checks).
 
 ## Quick start
 
@@ -90,7 +93,7 @@ The same settings apply to every project and workspace the module checks.
 where you stand (see [Discovery](#discovery)):
 
 ```sh
-dagger check      # lint, test, type-check and format-check every project and workspace
+dagger check      # lint, type-check and format-check every project and workspace, and test every test file
 dagger generate -y   # format: runs `deno fmt` and writes the result
 ```
 
@@ -104,12 +107,14 @@ of date (the `stale` check).
 ```sh
 dagger list deno-projects -a                        # standalone projects, by path
 dagger list deno-workspaces -a                      # Deno workspaces, by root path
-dagger check -l --all                               # one line per project/workspace and check
+dagger list deno-test-files -a                      # test files, by path
+dagger check -l --all                               # one line per project/workspace/test file and check
 
 dagger check --deno-project=apps/api                # every check on one project
 dagger check --deno --check test --deno-project=apps/api --deno-project=apps/web
 dagger check deno/projects/lint                     # one check on every project
-dagger check deno/workspaces/test --deno-workspace=packages
+dagger check deno/workspaces/test-files/test --deno-workspace=packages
+dagger check --deno-projects-test-file=apps/api/main_test.ts   # one test file
 dagger generate -y --deno-project=apps/api          # format just that project
 dagger -W ./apps/api check                          # or scope by directory
 ```
@@ -132,8 +137,10 @@ dagger call deno project --path apps/api test
 ```
 
 > **Use `dagger check` in CI.** `dagger call` on a check function (`lint`,
-> `test`, `type-check`, `format-check`) prints the result, but the command
-> exits 0 even when the check fails. `dagger check` fails the command.
+> `type-check`, `format-check`) prints the result, but the command exits 0
+> even when the check fails. `dagger check` fails the command. A project's
+> `test` is a plain function, not a check, so `dagger call ... test` fails
+> when a test does.
 
 > Don't want to install? Run a function one-off with `-m`, dropping the module
 > name: `dagger -m github.com/dagger/deno call project --path apps/api path`.
@@ -198,7 +205,7 @@ single `deno` command at the root, so the toolchain fans out across every member
 ```sh
 # run all members' checks at once (deno fans out from the root)
 dagger check --deno-workspace=packages
-dagger check deno/workspaces/test --deno-workspace=packages
+dagger check deno/workspaces/test-files/test --deno-workspace=packages
 
 # list the members
 dagger call deno workspace --path packages members path
@@ -221,39 +228,120 @@ dagger call deno project --path packages/ui workspace-root   # -> packages
 workspace is checked (with `deno` fanning out) and each standalone project is
 checked on its own — members are never run twice. A workspace's `members` is a
 plain list rather than a collection for that reason: its members are checked
-through the workspace, not one by one.
+through the workspace, not one by one. A workspace's test files are keyed
+across all its members and run in one `deno test` at the root (see
+[Tests](#tests)).
 
 ## Functions
 
 ### Checks (`dagger check`)
 
-| Function | Runs |
-|---|---|
-| `lint` | `deno lint` |
-| `test` | `deno test` |
-| `type-check` | `deno check` |
-| `format-check` | `deno fmt --check` |
+| Function | Runs | One check per |
+|---|---|---|
+| `lint` | `deno lint` | project / workspace |
+| `type-check` | `deno check` | project / workspace |
+| `format-check` | `deno fmt --check` | project / workspace |
+| `test` | `deno test` | test file (see [Tests](#tests)) |
 
-Each exists on a project (`project …`) and on a workspace (`workspace …`, running
-across every member at once).
+`lint`, `type-check` and `format-check` exist on a project (`project …`) and on
+a workspace (`workspace …`, running across every member at once). `test` is a
+check on each test file in a project's or workspace's `testFiles`.
 
 `projects` and `workspaces` on the root are collections, which is how
-`dagger check` finds them:
+`dagger check` finds them, and each item's `testFiles` is a collection too:
 
 | Collection | Keys | Dimension flag | Check addresses |
 |---|---|---|---|
-| `projects` | standalone project roots | `--deno-project=PATH` | `deno/projects/lint`, `…/test`, `…/type-check`, `…/format-check` |
-| `workspaces` | Deno workspace roots | `--deno-workspace=PATH` | `deno/workspaces/lint`, `…/test`, `…/type-check`, `…/format-check` |
+| `projects` | standalone project roots | `--deno-project=PATH` | `deno/projects/lint`, `…/type-check`, `…/format-check` |
+| `workspaces` | Deno workspace roots | `--deno-workspace=PATH` | `deno/workspaces/lint`, `…/type-check`, `…/format-check` |
+| a project's `testFiles` | test file paths | `--deno-projects-test-file=PATH` | `deno/projects/test-files/test` |
+| a workspace's `testFiles` | test file paths | `--deno-workspaces-test-file=PATH` | `deno/workspaces/test-files/test` |
+
+Test files are reached under two parents, so Dagger gives them one flag per
+parent: select a standalone project's file with `--deno-projects-test-file`
+and a workspace member's with `--deno-workspaces-test-file`. Two different
+dimension flags narrow together, so passing both selects nothing.
 
 The generators are `deno/projects/format` and `deno/workspaces/format`, and
 their staleness checks `deno/projects/format/stale` and
 `deno/workspaces/format/stale`. `dagger check --help` lists the flags in effect:
 `--deno` (`--by-deno`) selects this module, `--deno-projects` /
-`--deno-workspaces` a whole dimension.
+`--deno-workspaces` / `--deno-projects-test-files` a whole dimension.
 
-Each collection's batch runs its check on every selected item in parallel, then
-fails naming each item that failed. Its batch `format` returns one changeset
-over the selected items.
+The collections' own `lint`, `test`, `typeCheck`, `formatCheck` and `format`
+are plain functions, not checks or generators, so `dagger check` never runs the
+same work twice. Each runs its command on every selected item in parallel, then
+fails naming each item that failed; `format` returns one changeset over the
+selected items. There is no `.batch` namespace.
+
+### Tests
+
+Each test file has its own check. Every selected file of one project or
+workspace calls the same helper, which runs one `deno test` and indexes its
+report; the engine deduplicates the identical container operations, so N
+selected files cost one run per project or workspace. Separate projects and
+workspaces run separately, each in its own container with its own config and
+lockfile.
+
+- **Discovery** runs no container: a test file is what `deno test` collects
+  when it walks a directory — `test.*`, `*_test.*` or `*.test.*` with a `.ts`,
+  `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs` or `.cjs` extension, hidden
+  directories included, `node_modules` left out — minus the config's `exclude`
+  and `test.exclude`, and limited to `test.include` when it is set. In a
+  workspace, each member's own config excludes apply too. A standalone
+  project's files stop at a nested directory with its own `deno.json`, which
+  is a project of its own. A file must also register a test itself
+  (`Deno.test`, or `it`/`test`/`describe` as `@std/testing/bdd` and
+  `node:test` do): an empty placeholder or a file that only imports tests is
+  no check, as go leaves out test files that declare no test. Listing reads
+  the configs, globs the tree and runs one ripgrep search; it never runs
+  `deno` or a test, and a config that doesn't parse only drops its patterns.
+- **The command.** With every file of a project selected, the run is the
+  project's own `deno test` (with `<member>` for a workspace member), so
+  deno decides what runs and a failing test file discovery missed still fails
+  the checks. Once the selection leaves a file out (or the project holds a
+  nested project), the selected files are passed explicitly, in byte order.
+  Either way it adds `--junit-path` and the `permissions` and `testArgs`
+  settings, and its exit code is a result, not an error.
+- **The report.** A small indexer reads deno's JUnit report and its stdout
+  once and writes one bounded result per selected file (the last 32 KiB of
+  each output stream, at most 96 KiB per file), so a check's message stays
+  small however large the run.
+
+Attribution:
+
+- A failing test fails the check of the file deno reports it in, with the
+  failure's message and stack; the other files pass.
+- A module that throws outside any test fails only its own file's check.
+- `deno test` stopping before any test runs — a type error, a module that
+  doesn't load, a bad flag in `testArgs` — fails every selected file of that
+  project, with deno's error.
+- A failing test an imported helper registers is reported in the helper's
+  file by JUnit; deno's output says which test module ran it, so it fails
+  only the checks of the selected files that imported it.
+- A failure that can't be placed on a selected file — a doc test, a test file
+  discovery doesn't list, a helper's test run by an unselected module — fails
+  every file sharing the run. So does a failing exit with no failure to pin
+  on a file.
+- A project whose config deno can't parse fails its own selected files, with
+  deno's error naming the config; other projects are unaffected.
+- A selected file deno never ran, while the run passed, fails as "did not
+  run" rather than passing with nothing behind it (an `--ignore` in
+  `testArgs`, a config pattern discovery doesn't follow). A file that ran but
+  defines no tests passes, as it does for deno.
+- With `--fail-fast` in `testArgs`, files that never started after a reported
+  failure are not blamed for it.
+
+Logs and spans belong to the check that started the shared run; the other
+checks share its result. Test steps are reported with their test. Which
+module ran a test is read from deno's human-readable output (its
+`running N tests from` headers, or with `--parallel` the `./file =>` prefix on
+each test), since the JUnit report doesn't carry it.
+
+A project's and a workspace's `test` (`dagger call deno project --path apps/api
+test`) and the collections' `test` remain plain functions that run one whole
+`deno test`; `testFiles(ws).test(ws)` runs the shared helper over a collection
+of files (or a `subset`) and names each failing file.
 
 ### Test permissions
 
@@ -436,15 +524,20 @@ type MyApp {
       .project(ws, "apps/api")
     run(project.lint(ws))
     run(project.typeCheck(ws))
-    run(project.test(ws))
+    # `test` is a plain function: it raises when a test fails.
+    project.test(ws)
 
     # Or through the collections: every standalone project, one of them, or
-    # some of them. Keys are workspace-root-relative project paths.
+    # some of them. Keys are workspace-root-relative project paths. The
+    # collections' functions are plain helpers too.
     let projects = deno.projects(ws)
-    run(projects.batch.test(ws))
+    projects.test(ws)
     run(projects.get(key: "apps/web").lint(ws))
-    run(projects.subset(keys: ["apps/api", "apps/web"]).batch.formatCheck(ws))
-    run(deno.workspaces(ws).batch.typeCheck(ws))
+    projects.subset(keys: ["apps/api", "apps/web"]).formatCheck(ws)
+    deno.workspaces(ws).typeCheck(ws)
+
+    # Some of a project's test files, in one shared `deno test`.
+    project.testFiles(ws).subset(keys: ["apps/api/main_test.ts"]).test(ws)
     null
   }
 
@@ -483,15 +576,18 @@ type MyApp {
 }
 ```
 
-The collections' batches (`projects(ws).batch.lint(ws)`, `.test`, `.typeCheck`,
+The collections' helpers (`projects(ws).lint(ws)`, `.test`, `.typeCheck`,
 `.formatCheck`, and `.format` returning a `Changeset`) take the same `ws`; so
-does each item's function.
+does each item's function. Calling them from Dang runs them over the
+collection as you pass it: only `dagger check` applies the CLI's selection.
 
 ## Development
 
-The module is split into `deno.dang` (root `Deno` type and the `DenoProjects` /
-`DenoWorkspaces` collections), `deno-project.dang` (`DenoProject`), and
-`deno-workspace.dang` (`DenoWorkspace`).
+The module is split into `deno.dang` (root `Deno` type, the `DenoProjects` /
+`DenoWorkspaces` / `DenoTestFiles` collections and `DenoTestFile`),
+`deno-project.dang` (`DenoProject`), and `deno-workspace.dang`
+(`DenoWorkspace`). `helpers/deno-test-report` is the test report indexer, a
+dependency-free Deno script with its own unit tests.
 
 End-to-end tests live in [`.dagger/modules/e2e`](./.dagger/modules/e2e): a Dang
 module that installs this module and drives it against the sample projects under
@@ -504,4 +600,19 @@ dagger check -m .dagger/modules/e2e
 
 # or from the workspace root (also runs them)
 dagger check
+
+# just the selection checks
+dagger check 'e2e:selected-*'
 ```
+
+Direct Dang calls don't apply the engine's filtered collection view, so the
+`selected-*` checks drive selection through the CLI instead: each writes a
+fixture with a `dagger.toml` that installs this module, and runs the
+engine-provided, version-matched `dagger check` in a session of its own. They
+cover several projects and a workspace, excluded files not running, one
+command per project (`selected-shared-run-check`), an isolated failure, a type
+error, an uncaught error, a helper's failing test, a failure outside any
+selected file (the whole-run path), `--parallel`, an unparsable config, and a
+selected file that never ran. `listing-runs-no-tool-check` lists every test
+file with a `testArgs` that breaks every run and asserts no `deno` exec ran.
+Run them with Dagger v1.0.0-beta.22 or later.

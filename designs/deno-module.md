@@ -9,6 +9,11 @@
   (`deno/projects/test`, `--deno-project=PATH`). Keys follow `findRoots`
   (the enclosing project is selected from a subdirectory), and `test`'s
   permissions are a `permissions` setting ("config" = `-P`, "all", "none").
+  **Superseded again (v1.0.0-beta.22):** the engine no longer has a `.batch`
+  namespace. Those collection functions are plain helpers now; `lint`,
+  `typeCheck` and `formatCheck` are checks on each project and workspace, and
+  `test` is a check on each test file (`testFiles(ws): DenoTestFiles`), every
+  selected file of a project sharing one `deno test` (the README's "Tests").
   The [README](../README.md) describes the current API; the rest of this
   document is the original design record. 
 · SDK: **Dang** 
@@ -224,7 +229,7 @@ Deno                       (toolchain config: version, base)
  ├─ workspace(ws, path)    resolve the workspace containing a path
  ├─ projects(ws)           STANDALONE deno.json(c) discovered from the cwd → DenoProjects collection
  ├─ project(ws, path)      resolve the project containing a path (+ its workspace root)
- └─ (collections' batches: lint/test/typeCheck/formatCheck @check, format @generate
+ └─ (collections' plain helpers: lint/test/typeCheck/formatCheck, format
      — these replaced the original lintAll/testAll/.../formatAll aggregates)
 
 DenoWorkspace              (a monorepo: root deno.json with a `workspace` array)
