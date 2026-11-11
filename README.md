@@ -61,8 +61,8 @@ This adds a `[modules.deno]` entry to your `dagger.toml`. Its settings:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `version` | `"2.9.3"` | Deno version for the default base image (`denoland/deno:alpine-<version>`). |
-| `base` | the image above | Base container for Deno commands; it must have `deno` on `PATH`. |
+| `version` | unset | Deno version for the default base image (`denoland/deno:alpine-<version>`). Unset, each project uses its `.dvmrc`, else `2.9.8`. See [Deno version](#deno-version). |
+| `base` | unset | Base container for Deno commands; it must have `deno` on `PATH`. Unset, the image above. |
 | `permissions` | `"config"` | Permissions for `test` and `compile`: `"config"` (the deno.json permission sets, `-P`), `"all"` (`-A`) or `"none"`. See [Test permissions](#test-permissions). |
 | `testArgs` | `[]` | Extra `deno test` flags, e.g. `["--doc", "--parallel", "--ignore=_tools/"]`. |
 | `typeCheckArgs` | `[]` | Extra `deno check` flags, e.g. `["--allow-import"]`. |
@@ -72,7 +72,7 @@ This adds a `[modules.deno]` entry to your `dagger.toml`. Its settings:
 set). Set one with `dagger settings deno <key> <value>`; list values are JSON:
 
 ```sh
-dagger settings deno version 2.9.3
+dagger settings deno version 2.9.8
 dagger settings deno permissions all
 dagger settings deno testArgs '["--doc"]'
 dagger settings -u deno testArgs           # unset: back to the default
@@ -82,12 +82,31 @@ The first three write
 
 ```toml
 [modules.deno.settings]
-version = "2.9.3"
+version = "2.9.8"
 permissions = "all"
 testArgs = ["--doc"]
 ```
 
 The same settings apply to every project and workspace the module checks.
+
+#### Deno version
+
+The Deno version is, in order of precedence:
+
+1. the `version` setting, when set;
+2. the nearest [`.dvmrc`](https://github.com/justjavac/dvm) at or above the
+   project (or Deno workspace) root, so a monorepo can keep one at the top and
+   override it per project;
+3. the module's fallback, `2.9.8`.
+
+`.dvmrc` holds a bare version (`2.9.8`, or `v2.9.8`); only its first line is
+read. `dagger settings deno` shows no default for `version` because an unset
+setting is what lets `.dvmrc` apply. `dagger settings -u deno version` goes
+back to `.dvmrc`. To see what a project resolves to:
+
+```sh
+dagger call deno toolchain-version --path apps/api
+```
 
 **2. Run checks and generators.** Projects and workspaces are discovered from
 where you stand (see [Discovery](#discovery)):
@@ -350,9 +369,9 @@ of files (or a `subset`) and names each failing file.
 
 - **`"config"`** (default) runs `deno test -P`, which applies the permission set
   in the project's `deno.json` (`test.permissions`, or a top-level set). The
-  same policy then applies locally (`deno test -P`), in CI and here. Deno prints
-  `Permissions in the config file is an experimental feature and may change in
-  the future.` with every run. A project without a permission set gets **no**
+  same policy then applies locally (`deno test -P`), in CI and here. Deno's
+  `Permissions in the config file is an experimental feature` warning is
+  silenced here (via `DENO_LOG`, unless `testArgs` sets a log level). A project without a permission set gets **no**
   permissions this way, so its tests that need any fail with `NotCapable`.
 - **`"all"`** runs `deno test -A`. Use it when your CI grants permissions on the
   command line (`deno test -A`, `--allow-read …`), as denoland/std and oak do.
@@ -468,16 +487,17 @@ Deno 2.5.0, `"config"` builds with no permissions rather than `-A`:
 
 ### Toolchain container
 
-`base` is a ready-to-use container (Deno + cache). `install` adds the Deno CLI to
-a container you provide (a glibc base such as debian/ubuntu/distroless-cc; for
-musl/alpine use `base`).
+`toolchain` is a ready-to-use container (Deno + cache) for a path: `base` if set,
+otherwise the alpine image at the [resolved version](#deno-version). `install`
+adds the Deno CLI at that version to a container you provide (a glibc base such
+as debian/ubuntu/distroless-cc; for musl/alpine use `toolchain`).
 
 ```sh
 # drop into a shell with deno available
-dagger call deno base terminal
+dagger call deno toolchain terminal
 
-# print the configured version
-dagger call deno version
+# print the Deno version a path resolves to
+dagger call deno toolchain-version --path apps/api
 ```
 
 ### Configuration
@@ -488,7 +508,7 @@ constructor arguments, so `dagger call` takes them before the function. For
 
 ```sh
 # pin a specific Deno version
-dagger call deno --version 2.9.3 version
+dagger call deno --version 2.9.8 toolchain-version
 
 # bring your own base image
 dagger call deno --base docker.io/denoland/deno:debian project --path apps/api \
@@ -520,7 +540,7 @@ type MyApp {
   CI for this app: reuse Deno's checks, add our own.
   """
   ci(ws: Workspace!): Void @check {
-    let project = deno(version: "2.9.3", permissions: "all", testArgs: ["--doc"])
+    let project = deno(version: "2.9.8", permissions: "all", testArgs: ["--doc"])
       .project(ws, "apps/api")
     run(project.lint(ws))
     run(project.typeCheck(ws))

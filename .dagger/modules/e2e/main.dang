@@ -327,9 +327,9 @@ type E2e {
   """
   install adds a working Deno CLI to a bare glibc base image.
   """
-  installCheck: Void @check {
+  installCheck(ws: Workspace!): Void @check {
     let version = deno
-      .install(container.from("debian:stable-slim"))
+      .install(container.from("debian:stable-slim"), ws)
       .withExec(["deno", "--version"])
       .stdout
     assert(version.contains("deno 2"), "install did not produce a working deno: " + version)
@@ -378,6 +378,58 @@ type E2e {
   """
   legacyVersionCheck(ws: Workspace!): Void @check {
     deno(version: "2.4.0").project(ws, helloPath).test(ws)
+    null
+  }
+
+  """
+  The Deno version: the `version` setting wins over .dvmrc, the nearest .dvmrc
+  at or above a project wins over one further up, and with neither the module
+  falls back to its built-in version. The resolved version is the image that
+  runs.
+  """
+  dvmrcCheck: Void @check {
+    let w = directory
+      .withNewFile(".dvmrc", "v2.4.0\n")
+      .withNewFile("deno.json", "{}\n")
+      .withNewFile("app/deno.json", "{}\n")
+      .withNewFile("pinned/.dvmrc", "2.5.0\n")
+      .withNewFile("pinned/deno.json", "{}\n")
+      .asWorkspace
+    let root = deno.toolchainVersion(w)
+    assert(root == "2.4.0", ".dvmrc at the root resolved: " + root)
+    let app = deno.toolchainVersion(w, "app")
+    assert(app == "2.4.0", ".dvmrc above app resolved: " + app)
+    let pinned = deno.toolchainVersion(w, "pinned")
+    assert(pinned == "2.5.0", "nearer .dvmrc resolved: " + pinned)
+    let set = deno(version: "2.9.0").toolchainVersion(w, "pinned")
+    assert(set == "2.9.0", "the version setting lost to .dvmrc: " + set)
+    let ran = deno.project(w, "pinned").container(w).withExec(["deno", "--version"]).stdout
+    assert(ran.contains("deno 2.5.0"), "pinned did not run Deno 2.5.0: " + ran)
+
+    let bare = directory.withNewFile("deno.json", "{}\n").asWorkspace
+    let fallback = deno.toolchainVersion(bare)
+    assert(
+      fallback.split(".").length == 3,
+      "no fallback version without a setting or .dvmrc: " + fallback,
+    )
+    null
+  }
+
+  """
+  `-P` runs don't print Deno's "Permissions in the config file is an
+  experimental feature" warning, while test output still comes through.
+  """
+  permissionWarningCheck(ws: Workspace!): Void @check {
+    let output = deno
+      .project(ws, permNetPath)
+      .container(ws)
+      .withExec(["deno", "test", "-P"])
+      .combinedOutput
+    assert(
+      output.contains("experimental feature") == false,
+      "-P printed the experimental warning: " + output,
+    )
+    assert(output.contains("passed"), "-P test output missing: " + output)
     null
   }
 
