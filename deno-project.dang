@@ -132,7 +132,7 @@ type DenoProject {
     # 2.5.0 (no `-P`) it gets none, rather than forcing `-A` into a shipped
     # artifact.
     let targetFlag = if (target == null) { [] } else { ["--target", target] }
-    let permissionFlag = tool.permissionFlags(true)
+    let permissionFlag = tool.permissionFlags(true, tool.versionAt(ws, workspaceRoot))
     let out = "/tmp/out/" + outputName
     container(ws)
       .withExec(["deno", "compile"] + permissionFlag + ["--output", out] + targetFlag + [entrypoint])
@@ -146,6 +146,7 @@ type DenoProject {
   """
   let exec(ws: Workspace!, command: String!): Container! {
     let ctr = tool.mounted(ws, workspaceRoot)
+    let version = tool.versionAt(ws, workspaceRoot)
     if (command == "test") {
       # With its own session rather than the one running deno, a module address
       # resolves against the user's workspace instead of against this module.
@@ -155,9 +156,9 @@ type DenoProject {
       # are out of support. Only tests run user code, so only tests need it.
       ctr
         .withEnvVariable("_EXPERIMENTAL_DAGGER_CLI_BIN", "/dev/.dagger/dagger")
-        .withExec(tool.command(command, member), daggerInDaggerNewSession: true)
+        .withExec(tool.command(command, member, version), daggerInDaggerNewSession: true)
     } else {
-      ctr.withExec(tool.command(command, member))
+      ctr.withExec(tool.command(command, member, version))
     }
   }
 
@@ -176,7 +177,7 @@ type DenoProject {
   let formatted(ws: Workspace!): Directory! {
     tool
       .mounted(ws, workspaceRoot)
-      .withExec(tool.command("format", member))
+      .withExec(tool.command("format", member, tool.versionAt(ws, workspaceRoot)))
       .directory(if (member == "") { "." } else { member })
   }
 

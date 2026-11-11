@@ -5,14 +5,16 @@ https://deno.com
 """
 type Deno {
   """
-  Deno version for the default base image.
+  Deno version for the default base image, when set. Unset, the version comes
+  from the nearest .dvmrc at or above each project, else a built-in fallback.
   """
-  version: String!
+  version: String
 
   """
-  Base container for Deno commands. Must have `deno` on PATH.
+  Base container for Deno commands, when set. Must have `deno` on PATH. Unset,
+  denoland/deno:alpine-<version>.
   """
-  base: Container!
+  base: Container
 
   """
   Permissions `test` and `compile` run with: "config", "all" or "none".
@@ -37,8 +39,10 @@ type Deno {
   new(
     """
     Deno version for the default base image (denoland/deno:alpine-<version>).
+    Takes precedence over .dvmrc. Unset, each project uses the nearest .dvmrc
+    at or above it, else the module's fallback version.
     """
-    version: String! = "2.9.3",
+    version: String = null,
     """
     Base container for Deno commands. Must have `deno` on PATH.
     """
@@ -62,12 +66,11 @@ type Deno {
     """
     typeCheckTargets: [String!]! = ["."],
   ) {
+    # Both stay null when unset: the version can only be resolved against a
+    # workspace (its .dvmrc), which each function receives, so the default
+    # image is built per call in `toolchainAt` rather than here.
     self.version = version
     self.base = base
-      ?? container
-        .from("denoland/deno:alpine-" + version)
-        .withoutEntrypoint
-        .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
     # A string rather than an enum: enum settings can't be read from dagger.toml.
     if (["config", "all", "none"].contains(permissions) == false) {
       raise "permissions must be \"config\", \"all\" or \"none\", got: " + permissions
@@ -80,17 +83,78 @@ type Deno {
   }
 
   """
-  Install the Deno CLI and cache into a glibc-based container.
+  The Deno version used at a workspace path: the `version` setting, else the
+  nearest .dvmrc at or above the path, else the module's fallback version.
   """
-  install(ctr: Container!): Container! {
+  toolchainVersion(ws: Workspace!, path: String! = "."): String! {
+    versionAt(ws, resolvePath(ws, path))
+  }
+
+  """
+  The container Deno commands run in at a workspace path: `base` if set,
+  otherwise denoland/deno:alpine-<toolchainVersion>.
+  """
+  toolchain(ws: Workspace!, path: String! = "."): Container! {
+    toolchainAt(ws, resolvePath(ws, path))
+  }
+
+  """
+  Install the Deno CLI and cache into a glibc-based container, at the version
+  `toolchainVersion` resolves for `path`.
+  """
+  install(ctr: Container!, ws: Workspace!, path: String! = "."): Container! {
     # The denoland/deno:bin binary is glibc-linked, so for musl/alpine use the
-    # default `base` instead.
-    let denoBin = container.from("denoland/deno:bin-" + version).file("/deno")
+    # default `toolchain` instead.
+    let denoBin = container
+      .from("denoland/deno:bin-" + versionAt(ws, resolvePath(ws, path)))
+      .file("/deno")
     ctr
       # 493 == 0o755; Dang has no octal literals.
       .withFile("/usr/local/bin/deno", denoBin, permissions: 493)
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
+  }
+
+  """
+  The Deno version when neither the `version` setting nor a .dvmrc gives one.
+  Not the setting's default, so that an unset setting can defer to .dvmrc.
+  """
+  let fallbackVersion: String! = "2.9.8"
+
+  """
+  The Deno version for a workspace-root-relative directory; see
+  `toolchainVersion`.
+  """
+  let versionAt(ws: Workspace!, dir: String!): String! {
+    version ?? dvmrcVersion(ws, dir) ?? fallbackVersion
+  }
+
+  """
+  The version in the nearest .dvmrc at or above `dir` (workspace-relative), or
+  null when there is none or it is blank. Like dvm, it reads the first line
+  and drops a leading "v".
+  """
+  let dvmrcVersion(ws: Workspace!, dir: String!): String {
+    let from = if (dir == "." or dir == "") { "/" } else { "/" + dir }
+    let found = ws.findUp(".dvmrc", from)
+    if (found == null) {
+      null
+    } else {
+      let line = ws.file("/" + found.trimPrefix("/")).contents.trimSpace.split("\n")[0] ?? ""
+      let v = line.trimSpace.trimPrefix("v")
+      if (v == "") { null } else { v }
+    }
+  }
+
+  """
+  The container for a workspace-root-relative directory; see `toolchain`.
+  """
+  let toolchainAt(ws: Workspace!, dir: String!): Container! {
+    base
+      ?? container
+        .from("denoland/deno:alpine-" + versionAt(ws, dir))
+        .withoutEntrypoint
+        .withEnvVariable("DENO_NO_UPDATE_CHECK", "1")
   }
 
   """
@@ -407,7 +471,13 @@ type Deno {
   mounted at /src as the workdir.
   """
   let mounted(ws: Workspace!, dir: String!): Container! {
-    base
+    let toolchain = toolchainAt(ws, dir)
+    let ctr = if (usesPermissionSets(versionAt(ws, dir))) {
+      quietPermissionSets(toolchain)
+    } else {
+      toolchain
+    }
+    ctr
       .withEnvVariable("DENO_DIR", "/deno-dir")
       .withMountedCache("/deno-dir", cacheVolume("deno-cache"))
       .withDirectory(
@@ -436,15 +506,16 @@ type Deno {
   """
   The `deno` command line for one of the checks (by function name) or
   "format", run from the mounted root. `target` scopes it to a workspace
-  member's directory; "" runs it on the whole mount.
+  member's directory; "" runs it on the whole mount. `version` is the Deno
+  version it runs on (see `versionAt`), which decides the permission flags.
   """
-  let command(name: String!, target: String!): [String!]! {
+  let command(name: String!, target: String!, version: String!): [String!]! {
     let targets = if (target == "") { [] } else { [target] }
     if (name == "lint") {
       ["deno", "lint"] + targets
     } else if (name == "test") {
       # --permit-no-files: a project with no test files is a pass, not an error.
-      ["deno", "test", "--permit-no-files"] + permissionFlags(false) + testArgs + targets
+      ["deno", "test", "--permit-no-files"] + permissionFlags(false, version) + testArgs + targets
     } else if (name == "typeCheck") {
       ["deno", "check"] + typeCheckArgs + typeCheckTargets.map { t =>
         under(
@@ -480,17 +551,44 @@ type Deno {
   "config" uses -P, which Deno added in 2.5.0: below it, test falls back to -A
   and compile to no flag, rather than bake grant-all into a shipped binary.
   """
-  let permissionFlags(compile: Boolean!): [String!]! {
+  let permissionFlags(compile: Boolean!, version: String!): [String!]! {
     if (permissions == "all") {
       ["-A"]
     } else if (permissions == "none") {
       []
-    } else if (supportsPermissionSets) {
+    } else if (supportsPermissionSets(version)) {
       ["-P"]
     } else if (compile) {
       []
     } else {
       ["-A"]
+    }
+  }
+
+  """
+  Whether `test` and `compile` pass `-P` on a Deno version.
+  """
+  let usesPermissionSets(version: String!): Boolean! {
+    permissions == "config" and supportsPermissionSets(version)
+  }
+
+  """
+  `ctr` with Deno's "Permissions in the config file is an experimental
+  feature" warning silenced. Deno prints it on every `-P` run and has no flag
+  for it short of `--quiet`, which also stops `deno test` echoing test output.
+  It logs from the CLI's root module (target `deno`), so DENO_LOG lowers just
+  that target to errors; `deno::` (every submodule) and `deno_` (the other
+  crates) stay at info, the longer directive winning. Left alone when testArgs
+  sets a log level, since DENO_LOG would override it.
+  """
+  let quietPermissionSets(ctr: Container!): Container! {
+    let setsLogLevel = testArgs.any { a =>
+      a == "-q" or a == "--quiet" or a == "-L" or a.hasPrefix("--log-level")
+    }
+    if (setsLogLevel) {
+      ctr
+    } else {
+      ctr.withEnvVariable("DENO_LOG", "info,deno=error,deno::=info,deno_=info")
     }
   }
 
@@ -506,10 +604,10 @@ type Deno {
   }
 
   """
-  Whether the configured Deno version supports config-file permission sets and
-  the `-P` flag (added in Deno 2.5.0).
+  Whether a Deno version supports config-file permission sets and the `-P` flag
+  (added in Deno 2.5.0).
   """
-  let supportsPermissionSets: Boolean! {
+  let supportsPermissionSets(version: String!): Boolean! {
     let parts = version.split(".")
     let major = parts[0] ?? "0"
     let minor = if (parts.length > 1) { parts[1] ?? "0" } else { "0" }
@@ -1022,7 +1120,7 @@ type DenoTestFiles @collection {
       .withDirectory("/", directory.withNewDirectory("deno-test", permissions: 511))
       .withExec(
         ["deno", "test", "--permit-no-files"]
-          + tool.permissionFlags(false)
+          + tool.permissionFlags(false, tool.versionAt(ws, root))
           + tool.testArgs
           + ["--junit-path=/deno-test/report.xml"]
           + targets,
